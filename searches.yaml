@@ -1,0 +1,74 @@
+# Edit while the daemon runs; changes apply within a few seconds.
+global:
+  daily_call_budget: 4000          # stay under your real limit (Analytics API getRateLimits)
+  marketplace: EBAY_US
+  category_ids: ["183454"]         # CCG Individual Cards - verify in eBay's category tree
+  languages: []                    # API-level Language filter (drops listings with the field blank). [English] to enable
+  year_match: aspect               # aspect = eBay "Year Manufactured" filter (drops listings with it blank)
+                                   # title  = year as a keyword (only finds titles that contain the year)
+  year_aspect_name: Year Manufactured   # confirm the exact name with: python -m pokescan.check
+  page_size: 100                   # listings per call (max 200)
+  max_pages: 3                     # pages per query per poll; stops early once it reaches listings already seen
+  intervals_minutes: { high: 5, normal: 10, low: 30 }
+
+searches:
+  - name: wotc-era
+    enabled: false
+    years: [1999, 2000, 2001, 2002]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, "art card"]
+    filters:
+      price_min: 25
+      price_max: 5000
+      buying_options: [FIXED_PRICE, AUCTION]
+    priority: high
+
+  - name: ex-era
+    enabled: true
+    years: [2003, 2004, 2005, 2006, 2007]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 15, price_max: 3000 }
+    priority: normal
+
+  - name: hgss-era
+    enabled: false
+    years: [2010, 2011]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 10, price_max: 1500 }
+    priority: normal
+
+  # Years and sets can be combined to narrow things down (sets become a keyword OR-group):
+  # - name: unleashed-undaunted
+  #   years: [2010, 2011]
+  #   sets: [undaunted, call of legends, unleashed, triumphant]
+  #   set_batch_size: 4
+
+# ---- Phase 2: AI photo grading ----
+analysis:
+  enabled: false                   # set true once Phase 1 is running and ANTHROPIC_API_KEY is in .env
+  analyzer: classical              # classical = free OpenCV back-whitening check | claude = vision model
+  model: claude-sonnet-5-5         # claude analyzer only; change requires restart
+  max_images: 4
+  fetch_all_photos: true           # 1 getItem call per analyzed listing; needed to see the back of the card
+  max_analyses_per_day: 150        # hard cap on model spend
+  allowed_languages: [English]     # checked on listing details: Language set and not English -> FAIL; blank passes
+  auto_fail_title_terms: [japanese, japan, jpn, jp, 日本語, 日本]   # stored as FAIL before any photo/API spend
+  skip_title_terms: [psa, bgs, cgc, damaged, "heavily played", hp, poor, proxy]
+  classical:                       # tune these on real listings (see debug_dir images)
+    whitening_thresholds: [0.03, 0.12, 0.30]   # share of edge-band pixels that look white: minor / moderate / major
+    glare_zone_max: 0.35           # zone more than this covered by glare = "not checked" (never a fail)
+    blur_min: 15
+    debug_dir: data/debug          # saves annotated images per photo; set to null once calibrated
+  policy:
+    max_unassessed_zones: 2        # >2 of 8 edge zones hidden by glare -> REVIEW
+    max_severity:                  # worst tolerated per defect: none | minor | moderate | major
+      whitening: minor
+      edge_wear: minor
+      corner_wear: minor
+      scratch: minor
+      crease: none
+      dent: none
+      stain: none
+    min_confidence: 0.6            # less sure than this -> REVIEW instead of FAIL
+    require_back_photo: true
+    skip_graded: true
+    notify_review: true            # also push "photos unclear" listings for a manual look
