@@ -25,6 +25,8 @@ class SearchConfig(BaseModel):
     category_ids: list[str] | None = None  # overrides global when set
     languages: list[str] | None = None     # e.g. [English]; overrides global. [] = no language filter
     years: list[int] = []                  # e.g. [1999, 2000]; can be combined with sets
+    lookback_days: int | None = None       # overrides global; 0 = off
+    aspects: dict[str, list[str]] | None = None   # extra item-specific filters; merged over global (None = inherit)
     year_match: Literal["aspect", "title"] | None = None   # overrides global
 
 
@@ -33,7 +35,10 @@ class GlobalConfig(BaseModel):
     marketplace: str = "EBAY_US"
     category_ids: list[str] = []
     languages: list[str] = []              # eBay item-specific 'Language' filter, e.g. [English]
+    aspects: dict[str, list[str]] = {}     # any other item-specific filter, e.g. { Game: ["<value from pokescan.check>"] }
     page_size: int = Field(100, ge=1, le=200)
+    lookback_days: int = Field(10, ge=0)            # only consider listings created in the last N days (0 = off -> silent seeding instead)
+    backfill_max_pages: int = Field(10, ge=1, le=50)  # pages walked on a search's first run; stops at the lookback cutoff
     max_pages: int = Field(3, ge=1, le=10)          # pages per query; paging stops early at the first already-seen listing
     year_match: Literal["aspect", "title"] = "aspect"  # aspect = eBay item-specific filter (drops blanks); title = year as a keyword
     year_aspect_name: str = "Year Manufactured"     # verify with `python -m pokescan.check`

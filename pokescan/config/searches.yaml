@@ -3,19 +3,26 @@ global:
   daily_call_budget: 4000          # stay under your real limit (Analytics API getRateLimits)
   marketplace: EBAY_US
   category_ids: ["183454"]         # CCG Individual Cards - verify in eBay's category tree
+  # 183454 is ALL trading card games, not just Pokemon. Each search's `q` defaults to "pokemon", which keeps
+  # results on-topic. For a stricter filter, run `python -m pokescan.check`, find the "Game" item specific and
+  # its exact Pokemon value, then uncomment (the value below is a placeholder until you confirm it):
+  # aspects: { Game: ["Pokémon TCG"] }
   languages: []                    # API-level Language filter (drops listings with the field blank). [English] to enable
   year_match: aspect               # aspect = eBay "Year Manufactured" filter (drops listings with it blank)
                                    # title  = year as a keyword (only finds titles that contain the year)
   year_aspect_name: Year Manufactured   # confirm the exact name with: python -m pokescan.check
-  page_size: 100                   # listings per call (max 200)
-  max_pages: 3                     # pages per query per poll; stops early once it reaches listings already seen
+  page_size: 200                   # listings per call (max 200)
+  lookback_days: 1                 # only consider listings created in the last N days. No silent seeding: anything new
+                                   # inside the window is reported/analyzed, even on the first run. 0 = off (seed silently instead)
+  backfill_max_pages: 10           # pages walked on a search's FIRST run; stops once it reaches listings older than the window
+  max_pages: 5                     # pages per query per poll; stops early once it reaches listings already seen
   intervals_minutes: { high: 5, normal: 10, low: 30 }
 
 searches:
   - name: wotc-era
     enabled: true
     years: [1999, 2000, 2001, 2002]
-    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, "art card"]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, "art card", yugioh, yu-gi-oh, mtg, magic, digimon]
     filters:
       price_min: 25
       price_max: 5000
@@ -25,14 +32,14 @@ searches:
   - name: ex-era
     enabled: true
     years: [2003, 2004, 2005, 2006, 2007]
-    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, yugioh, yu-gi-oh, mtg, magic, digimon]
     filters: { price_min: 15, price_max: 3000 }
     priority: normal
 
   - name: hgss-era
     enabled: true
     years: [2010, 2011]
-    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, yugioh, yu-gi-oh, mtg, magic, digimon]
     filters: { price_min: 10, price_max: 1500 }
     priority: normal
 

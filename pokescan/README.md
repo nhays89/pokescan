@@ -39,3 +39,21 @@ Always-on: Task Scheduler -> trigger "At log on", action `<project>\.venv\Script
 or by keyword in the title (`year_match: title`). `sets:` still works and combines with years.
 Each query walks up to `max_pages` pages newest-first and stops at the first listing already seen.
 Run `python -m pokescan.check` to see the item-specific names/values eBay actually offers.
+
+## Manual runs (no scheduler)
+    python -m pokescan.main --once                 # poll every enabled search once, then exit
+    python -m pokescan.main --once --search ex-era # just one search
+    python -m pokescan.main --once --no-seed       # first run prints everything instead of silently seeding
+With analysis enabled, --once also waits for photo analysis of new listings to finish before exiting.
+
+## Lookback window (instead of seeding)
+`lookback_days: 10` (global, or per search): only listings created in the last 10 days are considered;
+older ones are never stored and paging stops when it reaches them. There is no silent first-run seeding,
+so the first run reports/analyzes whatever is new inside the window. `lookback_days: 0` restores seeding.
+With analysis on, shrink the window (e.g. 2) for the first run if you don't want a big backlog analyzed.
+
+## Running unattended
+- Logs go to the console AND data/pokescan.log (rotating, 2 MB x 3). Change with POKESCAN_LOG.
+- Alerts (to your NTFY_TOPIC, or the console if unset): one push when a search fails 3 polls in a row,
+  one when it recovers, and one per day when the API budget runs out.
+- Phone push: install the ntfy app, subscribe to your (unguessable) topic, put the same topic in .env as NTFY_TOPIC.

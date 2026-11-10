@@ -49,7 +49,7 @@ async def main() -> int:
             print(f"[{s.name}] {page.total} total matches; first query: {q!r}")
             for it in page.items[:3]:
                 price = f"{it.price.value:.2f} {it.price.currency}" if it.price else "n/a"
-                print(f"    {price:>12}  {it.title[:70]}")
+                print(f"    {price:>12}  {(it.itemCreationDate or 'no date')[:10]}  {it.title[:60]}")
             for it in page.items:
                 for c in it.raw.get("categories", []):
                     cats[(c.get("categoryId"), c.get("categoryName"))] += 1

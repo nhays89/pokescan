@@ -58,6 +58,10 @@ def build_params(search: SearchConfig, g: GlobalConfig, offset: int = 0, q: str 
         aspects.append(f"Language:{{{'|'.join(langs)}}}")
     if search.years and _year_mode(search, g) == "aspect":
         aspects.append(f"{g.year_aspect_name}:{{{'|'.join(str(y) for y in search.years)}}}")
+    extra = {**g.aspects, **(search.aspects or {})}
+    for name, vals in extra.items():
+        if vals:
+            aspects.append(f"{name}:{{{'|'.join(vals)}}}")
     if aspects:
         if len(cats) != 1:
             raise ValueError(f"[{search.name}] language/year aspect filters need exactly one category id (eBay requirement)")

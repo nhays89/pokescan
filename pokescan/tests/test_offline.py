@@ -72,3 +72,13 @@ def test_year_title_mode():
     sc = SearchConfig(name="x", years=[1999, 2000], sets=["jungle", "fossil"], set_batch_size=2)
     assert expand_queries(sc, g) == ["pokemon (jungle, fossil) (1999, 2000)"]
     assert "aspect_filter" not in build_params(sc, GlobalConfig(year_match="title"))   # title mode adds no aspect filter
+
+
+def test_generic_aspects_merge():
+    from pokescan.config.models import SearchConfig, GlobalConfig
+    g = GlobalConfig(category_ids=["183454"], aspects={"Game": ["Pokémon TCG"]})
+    p = build_params(SearchConfig(name="x"), g)
+    assert p["aspect_filter"] == "categoryId:183454,Game:{Pokémon TCG}"
+    p = build_params(SearchConfig(name="x", aspects={"Game": ["Pokémon TCG"], "Graded": ["No"]}), g)
+    assert p["aspect_filter"].endswith("Game:{Pokémon TCG},Graded:{No}")
+    assert "Game" not in build_params(SearchConfig(name="x", aspects={}), GlobalConfig(category_ids=["1"])).get("aspect_filter", "")

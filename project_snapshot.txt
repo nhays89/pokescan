@@ -1,0 +1,2294 @@
+
+
+=== FILE: ./pokescan/config/searches.yaml ===
+# Edit while the daemon runs; changes apply within a few seconds.
+global:
+  daily_call_budget: 4000          # stay under your real limit (Analytics API getRateLimits)
+  marketplace: EBAY_US
+  category_ids: ["183454"]         # CCG Individual Cards - verify in eBay's category tree
+  languages: []                    # API-level Language filter (drops listings with the field blank). [English] to enable
+  year_match: aspect               # aspect = eBay "Year Manufactured" filter (drops listings with it blank)
+                                   # title  = year as a keyword (only finds titles that contain the year)
+  year_aspect_name: Year Manufactured   # confirm the exact name with: python -m pokescan.check
+  page_size: 100                   # listings per call (max 200)
+  max_pages: 3                     # pages per query per poll; stops early once it reaches listings already seen
+  intervals_minutes: { high: 5, normal: 10, low: 30 }
+
+searches:
+  - name: wotc-era
+    enabled: true
+    years: [1999, 2000, 2001, 2002]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, "art card"]
+    filters:
+      price_min: 25
+      price_max: 5000
+      buying_options: [FIXED_PRICE, AUCTION]
+    priority: high
+
+  - name: ex-era
+    enabled: true
+    years: [2003, 2004, 2005, 2006, 2007]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 15, price_max: 3000 }
+    priority: normal
+
+  - name: hgss-era
+    enabled: true
+    years: [2010, 2011]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 10, price_max: 1500 }
+    priority: normal
+
+  # Years and sets can be combined to narrow things down (sets become a keyword OR-group):
+  # - name: unleashed-undaunted
+  #   years: [2010, 2011]
+  #   sets: [undaunted, call of legends, unleashed, triumphant]
+  #   set_batch_size: 4
+
+# ---- Phase 2: AI photo grading ----
+analysis:
+  enabled: false                   # set true once Phase 1 is running and ANTHROPIC_API_KEY is in .env
+  analyzer: classical              # classical = free OpenCV back-whitening check | claude = vision model
+  model: claude-sonnet-5-5         # claude analyzer only; change requires restart
+  max_images: 4
+  fetch_all_photos: true           # 1 getItem call per analyzed listing; needed to see the back of the card
+  max_analyses_per_day: 150        # hard cap on model spend
+  allowed_languages: [English]     # checked on listing details: Language set and not English -> FAIL; blank passes
+  auto_fail_title_terms: [japanese, japan, jpn, jp, 日本語, 日本]   # stored as FAIL before any photo/API spend
+  skip_title_terms: [psa, bgs, cgc, damaged, "heavily played", hp, poor, proxy]
+  classical:                       # tune these on real listings (see debug_dir images)
+    whitening_thresholds: [0.03, 0.12, 0.30]   # share of edge-band pixels that look white: minor / moderate / major
+    glare_zone_max: 0.35           # zone more than this covered by glare = "not checked" (never a fail)
+    blur_min: 15
+    debug_dir: data/debug          # saves annotated images per photo; set to null once calibrated
+  policy:
+    max_unassessed_zones: 2        # >2 of 8 edge zones hidden by glare -> REVIEW
+    max_severity:                  # worst tolerated per defect: none | minor | moderate | major
+      whitening: minor
+      edge_wear: minor
+      corner_wear: minor
+      scratch: minor
+      crease: none
+      dent: none
+      stain: none
+    min_confidence: 0.6            # less sure than this -> REVIEW instead of FAIL
+    require_back_photo: true
+    skip_graded: true
+    notify_review: true            # also push "photos unclear" listings for a manual look
+
+
+=== FILE: ./pokescan/pokescan/analysis/base.py ===
+from __future__ import annotations
+from pathlib import Path
+from typing import Literal, Protocol
+from pydantic import BaseModel, Field, field_validator
+from pokescan.domain.models import Listing, Severity, SEVERITY_ORDER
+
+DEFECT_TYPES = {"whitening", "edge_wear", "corner_wear", "scratch", "crease", "dent", "stain", "print_line", "other"}
+
+
+class Defect(BaseModel):
+    type: str
+    location: str = ""
+    severity: Severity
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _type(cls, v):  # unknown labels from the model degrade to "other" instead of crashing
+        v = str(v).lower().strip().replace(" ", "_")
+        return v if v in DEFECT_TYPES else "other"
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _sev(cls, v):
+        v = str(v).lower().strip()
+        return v if v in SEVERITY_ORDER else "moderate"
+
+
+class ConditionReport(BaseModel):
+    card_name: str = ""
+    is_graded_slab: bool = False
+    looks_authentic: bool = True
+    image_quality: Literal["good", "limited", "insufficient"]
+    front_visible: bool
+    back_visible: bool
+    defects: list[Defect] = []
+    centering: Literal["good", "off", "unknown"] = "unknown"
+    overall: Literal["near_mint_or_better", "light_play", "moderate_play", "heavy_play", "unclear"]
+    summary: str = ""
+    scope: Literal["full", "back_only"] = "full"   # classical analyzer only judges the back
+    unassessed_zones: list[str] = []               # edge/corner zones hidden by glare etc.
+    # filled in by the analyzer, not requested from the model
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class ConditionAnalyzer(Protocol):
+    async def analyze(self, listing: Listing, images: list[Path]) -> ConditionReport: ...
+
+
+=== FILE: ./pokescan/pokescan/analysis/classical.py ===
+"""Classical-CV analyzer: judges whitening on the BACK of a card. No ML, no API cost.
+
+Pipeline per photo: find card -> perspective-warp to a fixed 630x880 canvas -> decide if it is the
+back (blue border ring) -> build an edge band split into 8 zones (4 edges, 4 corners) ->
+mask out flash glare -> score the fraction of "whitish" pixels per zone.
+
+Design rule: glare must never be the reason a card is rejected. Glare pixels are excluded from
+scoring; zones mostly hidden by glare are reported as UNASSESSED (not as defects); and zone
+results are merged across all back photos, since glare moves between shots."""
+from __future__ import annotations
+import asyncio, logging
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Callable
+import cv2
+import numpy as np
+from pokescan.config.models import ClassicalConfig
+from pokescan.domain.models import Listing
+from .base import ConditionReport, Defect
+
+log = logging.getLogger(__name__)
+W, H = 630, 880                      # 2.5 x 3.5 in at 252 px/in
+CORNER_R = 30
+ZONES = ["top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"]
+SEV_ORDER = ["none", "minor", "moderate", "major"]
+
+
+# ---------- geometry ----------
+@lru_cache(maxsize=1)
+def _dist_map() -> np.ndarray:
+    """Distance (px) from each pixel inside the rounded card rectangle to its outline."""
+    m = np.zeros((H, W), np.uint8)
+    cv2.rectangle(m, (CORNER_R, 0), (W - CORNER_R - 1, H - 1), 255, -1)
+    cv2.rectangle(m, (0, CORNER_R), (W - 1, H - CORNER_R - 1), 255, -1)
+    for cx, cy in [(CORNER_R, CORNER_R), (W - CORNER_R - 1, CORNER_R),
+                   (CORNER_R, H - CORNER_R - 1), (W - CORNER_R - 1, H - CORNER_R - 1)]:
+        cv2.circle(m, (cx, cy), CORNER_R, 255, -1)
+    m = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)  # image border must count as outside
+    return cv2.distanceTransform(m, cv2.DIST_L2, 5)[1:-1, 1:-1]
+
+
+@lru_cache(maxsize=8)
+def _zone_labels(lo: int, hi: int) -> np.ndarray:
+    """int8 map: -1 = not in band, 0..7 = index into ZONES."""
+    dist = _dist_map()
+    ring = (dist >= lo) & (dist < hi)
+    ys, xs = np.mgrid[0:H, 0:W]
+    cw, ch = int(0.12 * W), int(0.085 * H)
+    l, r, t, b = xs < cw, xs >= W - cw, ys < ch, ys >= H - ch
+    lab = np.full((H, W), -1, np.int8)
+    side = np.argmin(np.stack([ys, H - 1 - ys, xs, W - 1 - xs]), axis=0)  # 0 top,1 bottom,2 left,3 right
+    for i in range(4):
+        lab[ring & (side == i)] = i
+    for idx, m in zip(range(4, 8), [t & l, t & r, b & l, b & r]):
+        lab[ring & m] = idx
+    return lab
+
+
+def _order(pts: np.ndarray) -> np.ndarray:
+    pts = pts.reshape(4, 2).astype(np.float32)
+    s, d = pts.sum(1), np.diff(pts, axis=1).ravel()
+    return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], np.float32)
+
+
+def _fit_pass(quad: np.ndarray, pts: np.ndarray, tol_frac: float, outer_px: float | None = None):
+    """One pass: fit a line to the contour points near each side's middle 60%, intersect neighbours.
+    Returns (new_quad, residuals_ok) or None if a side has too few points."""
+    lines, ok = [], True
+    cen = quad.mean(axis=0)
+    for i in range(4):
+        a, b = quad[i], quad[(i + 1) % 4]
+        d = b - a
+        L = float(np.linalg.norm(d))
+        if L < 1:
+            return None
+        u = d / L
+        n = np.array([-u[1], u[0]], np.float32)
+        rel = pts - a
+        t, off = rel @ u / L, np.abs(rel @ n)
+        keep = (t > 0.2) & (t < 0.8) & (off < max(10.0, tol_frac * L))
+        if outer_px is not None:
+            # Wear/whitening only ever shrinks the visible card, so the true edge is the OUTERMOST
+            # contour. Drop points lying more than outer_px inside the current line.
+            n_out = n if float((a + b) / 2 @ n - cen @ n) > 0 else -n
+            keep &= (rel @ n_out) > -outer_px
+        sel = pts[keep]
+        if len(sel) < 20:
+            return None
+        vx, vy, x0, y0 = cv2.fitLine(sel, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        p0, dv = np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+        resid = np.abs((sel - p0) @ np.array([-dv[1], dv[0]], np.float32))
+        ok &= bool((resid < 4.0).mean() >= 0.8)
+        lines.append((p0, dv))
+    out = []
+    for i in range(4):
+        (p1, d1), (p2, d2) = lines[i - 1], lines[i]
+        A = np.array([[d1[0], -d2[0]], [d1[1], -d2[1]]])
+        if abs(np.linalg.det(A)) < 1e-6:
+            return None
+        t = np.linalg.solve(A, p2 - p1)
+        out.append(p1 + t[0] * d1)
+    return np.array(out, np.float32), ok
+
+
+def _refine(quad: np.ndarray, pts: np.ndarray):
+    """A 4-point polygon fit cuts off the rounded corners and is thrown by glare near a corner.
+    Re-fit straight sides with tightening tolerances. Returns (quad, ok); ok=False means the outline
+    could not be trusted (so the caller must not score whitening from it)."""
+    ok = False
+    for tol, outer in ((0.08, None), (0.04, None), (0.02, 3.0), (0.02, 2.0), (0.02, 2.0)):
+        res = _fit_pass(quad, pts, tol, outer)
+        if res is None:
+            return quad, False
+        quad, ok = res
+    return quad, ok
+
+
+def find_card(img: np.ndarray) -> np.ndarray | None:
+    """Return the 4 card corners (tl,tr,br,bl; portrait) in img coordinates, or None."""
+    h, w = img.shape[:2]
+    scale = 1000.0 / max(h, w) if max(h, w) > 1000 else 1.0
+    small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1 else img
+    gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    edges = cv2.Canny(gray, 40, 120)
+    # Ignore edges created by flash glare (a blown-out blob's own boundary is not the card outline).
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    blown = ((hsv[..., 2] >= 245) & (hsv[..., 1] <= 40)).astype(np.uint8)
+    blown = cv2.morphologyEx(blown, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    if blown.any():
+        blown = cv2.dilate(blown, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+        edges[blown > 0] = 0
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    img_area = small.shape[0] * small.shape[1]
+    best, best_area = None, 0.0
+    for c in cnts:
+        hull = cv2.convexHull(c)
+        ha = cv2.contourArea(hull)
+        if ha < 0.12 * img_area or ha > 0.995 * img_area:
+            continue
+        peri, quad = cv2.arcLength(hull, True), None
+        for eps in (0.01, 0.02, 0.03, 0.04):
+            ap = cv2.approxPolyDP(hull, eps * peri, True)
+            if len(ap) == 4:
+                quad = ap
+                break
+        if quad is None:
+            quad = cv2.boxPoints(cv2.minAreaRect(hull))
+        quad = _order(quad)
+        wd = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
+        ht = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
+        if min(wd, ht) < 1 or not (0.62 <= min(wd, ht) / max(wd, ht) <= 0.80):
+            continue
+        qa = cv2.contourArea(quad)
+        if qa < 1 or ha / qa > 1.15 or ha / qa < 0.85:   # must be rectangle-like
+            continue
+        quad, fit_ok = _refine(quad, c.reshape(-1, 2).astype(np.float32))
+        if not fit_ok:
+            continue
+        if wd > ht:                                        # landscape -> rotate to portrait
+            quad = np.roll(quad, -1, axis=0)
+        if ha > best_area:
+            best, best_area = quad, ha
+    return None if best is None else best / scale
+
+
+# ---------- per-photo analysis ----------
+@dataclass
+class ZoneResult:
+    score: float | None            # fraction of whitish pixels among usable ones; None = not assessed
+    confidence: float = 0.0
+    glare_frac: float = 0.0
+    note: str = ""
+
+
+@dataclass
+class PhotoAnalysis:
+    found: bool = False
+    is_back: bool = False
+    back_score: float = 0.0
+    blurry: bool = False
+    bg_bright: bool = False
+    zones: dict[str, ZoneResult] = field(default_factory=dict)
+
+
+def _glare_mask(V, S, dist, cfg: ClassicalConfig) -> np.ndarray:
+    core = ((V >= cfg.glare_v) & (S <= cfg.glare_s)).astype(np.uint8)
+    k = cfg.glare_min_px
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    glare = np.zeros_like(core)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < cfg.glare_min_area:
+            continue
+        comp = lab == i
+        if dist[comp].max() < cfg.glare_interior_px:   # hugs the edge: that's wear, not glare
+            continue
+        glare[comp] = 1
+    if glare.any() and cfg.glare_halo_px > 0:
+        g = 2 * cfg.glare_halo_px + 1
+        glare = cv2.dilate(glare, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    return glare.astype(bool)
+
+
+def analyze_photo(img: np.ndarray, cfg: ClassicalConfig, debug_prefix: Path | None = None) -> PhotoAnalysis:
+    out = PhotoAnalysis()
+    quad = find_card(img)
+    if quad is None:
+        _save(debug_prefix, "found", _label(img.copy(), "NO CARD FOUND"))
+        return out
+    out.found = True
+    dst = np.array([[0, 0], [W, 0], [W, H], [0, H]], np.float32)
+    warped = cv2.warpPerspective(img, cv2.getPerspectiveTransform(quad.astype(np.float32), dst), (W, H))
+    dist = _dist_map()
+
+    # is it the back? (blue border ring)
+    hsv = cv2.cvtColor(cv2.medianBlur(warped, 3), cv2.COLOR_BGR2HSV)
+    Hh, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    ring = (dist >= 0.04 * W) & (dist <= 0.12 * W)
+    blue = (Hh >= 95) & (Hh <= 135) & (S > 70) & (V > 25)
+    out.back_score = float(blue[ring].mean())
+    out.is_back = out.back_score >= cfg.back_blue_min
+
+    # photo-quality signals
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    out.blurry = float(cv2.Laplacian(gray, cv2.CV_64F).var()) < cfg.blur_min
+    q = quad.astype(np.int32)
+    qmask = np.zeros(img.shape[:2], np.uint8)
+    cv2.fillConvexPoly(qmask, q, 255)
+    outer = cv2.dilate(qmask, np.ones((41, 41), np.uint8)) & ~qmask
+    if outer.any():
+        ihsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        o = outer.astype(bool)
+        out.bg_bright = bool(((ihsv[..., 2][o] > 170) & (ihsv[..., 1][o] < 60)).mean() > 0.5)
+
+    if not out.is_back:
+        _save(debug_prefix, "found", _label(_draw_quad(img, quad), f"NOT BACK (blue={out.back_score:.2f})"))
+        return out
+
+    # whitening / glare
+    ref = (dist >= 0.06 * W) & (dist < 0.12 * W)
+    ref_s, ref_v = float(np.median(S[ref])), float(np.median(V[ref]))
+    whitish = (S < min(cfg.white_s_max, 0.45 * ref_s)) & (V > max(cfg.white_v_min, ref_v + 35))
+    glare = _glare_mask(V, S, dist, cfg)
+    labels = _zone_labels(cfg.inset_px, cfg.inset_px + int(cfg.band_pct * W))
+    t_mod = cfg.whitening_thresholds[1]
+    base_conf = 0.92 - (0.2 if out.blurry else 0) - (0.3 if out.bg_bright else 0)
+    for zi, name in enumerate(ZONES):
+        zm = labels == zi
+        total = int(zm.sum())
+        usable = zm & ~glare
+        gfrac = 1 - usable.sum() / max(total, 1)
+        if gfrac > cfg.glare_zone_max:
+            out.zones[name] = ZoneResult(None, 0.0, gfrac, "glare")
+            continue
+        sc = float(whitish[usable].mean())
+        wz = whitish & usable
+        blown = float(((V >= 248) & wz).sum() / max(wz.sum(), 1))
+        if sc >= t_mod and blown > 0.5:                # looks like blown-out glare, not paper-white wear
+            out.zones[name] = ZoneResult(None, 0.0, gfrac, "possible glare")
+            continue
+        out.zones[name] = ZoneResult(sc, float(np.clip(base_conf - 0.5 * gfrac, 0.05, 0.95)), gfrac)
+
+    if debug_prefix is not None:
+        _save(debug_prefix, "found", _label(_draw_quad(img, quad), f"BACK (blue={out.back_score:.2f})"))
+        vis = warped.copy()
+        vis[whitish & (labels >= 0)] = (0, 0, 255)                       # red = counted as whitish
+        vis[glare] = (0.55 * vis[glare] + 0.45 * np.array([255, 255, 0])).astype(np.uint8)  # cyan tint = glare
+        vis[(labels >= 0) & ~whitish & ~glare] = (0.75 * vis[(labels >= 0) & ~whitish & ~glare]
+                                                  + 0.25 * np.array([0, 255, 0])).astype(np.uint8)
+        cv2.putText(vis, "red=whitish cyan=glare green=band", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        for zi, name in enumerate(ZONES):
+            ys, xs = np.nonzero(labels == zi)
+            if len(xs) == 0:
+                continue
+            z = out.zones[name]
+            txt = f"{z.score:.2f}" if z.score is not None else z.note
+            cx, cy = int(np.clip(xs.mean(), 60, W - 60)), int(np.clip(ys.mean(), 50, H - 20))
+            cv2.putText(vis, txt, (cx - 25, cy + 40 if cy < H / 2 else cy - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        _save(debug_prefix, "zones", vis)
+    return out
+
+
+def _draw_quad(img, quad):
+    out = img.copy()
+    cv2.polylines(out, [quad.astype(np.int32)], True, (0, 255, 0), max(2, img.shape[1] // 300))
+    return out
+
+
+def _label(img, text):
+    cv2.putText(img, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, max(0.8, img.shape[1] / 1200), (0, 255, 255), 3)
+    return img
+
+
+def _save(prefix: Path | None, kind: str, img: np.ndarray) -> None:
+    if prefix is None:
+        return
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    scale = 1000 / max(img.shape[:2]) if max(img.shape[:2]) > 1000 else 1
+    if scale != 1:
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    cv2.imwrite(f"{prefix}_{kind}.jpg", img)
+
+
+# ---------- listing-level analyzer ----------
+def _severity(score: float, th: tuple[float, float, float]) -> str:
+    return "none" if score < th[0] else "minor" if score < th[1] else "moderate" if score < th[2] else "major"
+
+
+class ClassicalAnalyzer:
+    """Implements ConditionAnalyzer. cfg_provider is called per listing, so YAML edits hot-reload."""
+
+    def __init__(self, cfg_provider: Callable[[], ClassicalConfig] | ClassicalConfig):
+        self._cfg = cfg_provider if callable(cfg_provider) else (lambda: cfg_provider)
+
+    async def analyze(self, listing: Listing, images: list[Path]) -> ConditionReport:
+        return await asyncio.to_thread(self._analyze_sync, listing, images, self._cfg())
+
+    def _analyze_sync(self, listing: Listing, images: list[Path], cfg: ClassicalConfig) -> ConditionReport:
+        safe = listing.item_id.replace("|", "_").replace("/", "_")
+        photos: list[PhotoAnalysis] = []
+        for i, path in enumerate(images):
+            img = cv2.imread(str(path))
+            if img is None:
+                photos.append(PhotoAnalysis())
+                continue
+            prefix = Path(cfg.debug_dir) / safe / str(i) if cfg.debug_dir else None
+            photos.append(analyze_photo(img, cfg, prefix))
+
+        backs = [p for p in photos if p.is_back]
+        found_any = any(p.found for p in photos)
+        defects: list[Defect] = []
+        unassessed: list[str] = []
+        worst = 0
+        if backs:
+            for name in ZONES:
+                obs = [(p.zones[name], p) for p in backs if name in p.zones and p.zones[name].score is not None]
+                if not obs:
+                    unassessed.append(name)
+                    continue
+                z, _ = max(obs, key=lambda o: o[0].score)        # worst usable observation, conservatively
+                sev = _severity(z.score, cfg.whitening_thresholds)
+                worst = max(worst, SEV_ORDER.index(sev))
+                if sev != "none":
+                    defects.append(Defect(type="whitening", location=name, severity=sev, confidence=round(z.confidence, 2)))
+
+        if not found_any:
+            quality = "insufficient"
+        elif not backs:
+            quality = "good"
+        elif len(unassessed) >= 6:
+            quality = "insufficient"
+        elif unassessed or all(p.blurry or p.bg_bright for p in backs):
+            quality = "limited"
+        else:
+            quality = "good"
+
+        overall = "unclear" if (not backs or len(unassessed) > 4) else \
+            ["near_mint_or_better", "light_play", "moderate_play", "heavy_play"][worst]
+        parts = []
+        for n in ZONES:
+            vals = [p.zones[n].score for p in backs if n in p.zones and p.zones[n].score is not None]
+            if vals:
+                parts.append(f"{n}:{max(vals):.2f}")
+        scores = ", ".join(parts)
+        summary = (f"Back-only automated check ({len(backs)} back photo(s) of {len(images)}). "
+                   + (f"Whitening scores: {scores}." if backs else "No back photo identified."))
+        return ConditionReport(
+            image_quality=quality, front_visible=False, back_visible=bool(backs), defects=defects,
+            overall=overall, summary=summary, scope="back_only", unassessed_zones=unassessed,
+            model="classical-v1")
+
+
+=== FILE: ./pokescan/pokescan/analysis/claude_vision.py ===
+from __future__ import annotations
+import base64, json, mimetypes
+from pathlib import Path
+from anthropic import AsyncAnthropic
+from pokescan.domain.models import Listing
+from .base import ConditionReport
+
+SYSTEM = """You are an expert condition assessor for vintage Pokemon TCG cards, reviewing eBay listing photos of a RAW (ungraded) card.
+Be conservative and honest: report only what you can actually see, and lower your confidence when you are unsure.
+
+Look closely for:
+- whitening / silvering on edges and corners (most visible on the dark blue border of the BACK)
+- scratches and print lines on holo or glossy surfaces (often visible only at an angle or in glare)
+- creases, dents, indentations, bends
+- stains, water damage, residue
+- edge chipping, corner wear, centering
+
+Photo problems matter: blur, glare, low resolution, heavy cropping, sleeves/toploaders and dark backgrounds can hide or mimic defects.
+image_quality: "good" = sharp, whole card, enough to judge; "limited" = usable but some blur/glare/cropping; "insufficient" = cannot reliably judge.
+Severity: "minor" = only visible on close inspection; "moderate" = obvious at normal viewing; "major" = prominent/ severe.
+If the photos show a PSA/BGS/CGC slab, set is_graded_slab true. If the card looks like a proxy, custom, reprint or fake, set looks_authentic false.
+
+Respond with ONE JSON object and nothing else:
+{
+  "card_name": string,
+  "is_graded_slab": bool,
+  "looks_authentic": bool,
+  "image_quality": "good"|"limited"|"insufficient",
+  "front_visible": bool,
+  "back_visible": bool,
+  "defects": [{"type": "whitening"|"edge_wear"|"corner_wear"|"scratch"|"crease"|"dent"|"stain"|"print_line"|"other",
+               "location": string, "severity": "none"|"minor"|"moderate"|"major", "confidence": number 0-1}],
+  "centering": "good"|"off"|"unknown",
+  "overall": "near_mint_or_better"|"light_play"|"moderate_play"|"heavy_play"|"unclear",
+  "summary": string (one or two sentences)
+}"""
+
+
+def _extract_json(text: str) -> dict:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError(f"No JSON object in model output: {text[:200]!r}")
+    return json.loads(text[start:end + 1])
+
+
+class ClaudeVisionAnalyzer:
+    def __init__(self, model: str = "claude-sonnet-5-5", client: AsyncAnthropic | None = None,
+                 max_tokens: int = 1500):
+        self.model, self.max_tokens = model, max_tokens
+        self.client = client or AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+
+    async def analyze(self, listing: Listing, images: list[Path]) -> ConditionReport:
+        content: list[dict] = []
+        for i, path in enumerate(images, 1):
+            media = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+            data = base64.standard_b64encode(path.read_bytes()).decode()
+            content.append({"type": "text", "text": f"Photo {i} of {len(images)}:"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
+        content.append({"type": "text", "text": f"Listing title: {listing.title}\nAssess this card. JSON only."})
+
+        resp = await self.client.messages.create(
+            model=self.model, max_tokens=self.max_tokens, system=SYSTEM,
+            messages=[{"role": "user", "content": content}])
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        report = ConditionReport.model_validate(_extract_json(text))
+        report.model = self.model
+        report.input_tokens = resp.usage.input_tokens
+        report.output_tokens = resp.usage.output_tokens
+        return report
+
+
+=== FILE: ./pokescan/pokescan/analysis/handler.py ===
+from __future__ import annotations
+import asyncio, logging, re
+from pokescan.analysis.policy import QualityPolicy, Verdict
+from pokescan.domain.models import Listing
+from pokescan.ebay.errors import EbayError
+
+log = logging.getLogger(__name__)
+
+
+class AnalysisHandler:
+    """ListingHandler for Phase 2. handle() only enqueues, so slow image downloads and
+    model calls never block the eBay polling loop; run() drains the queue."""
+
+    def __init__(self, loader, client, images, analyzer, notifier, listings, assessments, notifications,
+                 queue_size: int = 200):
+        self.loader, self.client, self.images, self.analyzer = loader, client, images, analyzer
+        self.notifier, self.listings = notifier, listings
+        self.assessments, self.notifications = assessments, notifications
+        self.queue: asyncio.Queue[Listing] = asyncio.Queue(maxsize=queue_size)
+
+    async def handle(self, listing: Listing) -> None:
+        try:
+            self.queue.put_nowait(listing)
+        except asyncio.QueueFull:
+            log.warning("analysis queue full, dropping %s", listing.item_id)
+
+    async def run(self) -> None:
+        while True:
+            listing = await self.queue.get()
+            try:
+                await self.process(listing)
+            except Exception:
+                log.exception("analysis failed for %s", listing.item_id)
+            finally:
+                self.queue.task_done()
+
+    @staticmethod
+    def _skip_by_title(title: str, terms: list[str]) -> str | None:
+        for t in terms:
+            if t.isascii():
+                if re.search(rf"\b{re.escape(t)}\b", title, re.IGNORECASE):
+                    return t
+            elif t in title:  # CJK has no spaces/word boundaries: plain substring
+                return t
+        return None
+
+    async def process(self, listing: Listing) -> None:
+        cfg = self.loader.current().analysis
+        if not cfg.enabled or self.assessments.has_assessment(listing.item_id):
+            return
+        if (term := self._skip_by_title(listing.title, cfg.auto_fail_title_terms)):
+            self.assessments.add_rule_fail(listing.item_id, f"auto-fail: title contains {term!r}")
+            log.info("auto-fail %s (title term %r)", listing.item_id, term)
+            return
+        if (term := self._skip_by_title(listing.title, cfg.skip_title_terms)):
+            log.info("skip %s (title term %r)", listing.item_id, term)
+            return
+        if self.assessments.count_today() >= cfg.max_analyses_per_day:
+            log.warning("daily analysis cap (%d) reached", cfg.max_analyses_per_day)
+            return
+
+        urls = [listing.image_url] if listing.image_url else []
+        if cfg.fetch_all_photos:
+            try:
+                detail = await self.client.get_item(listing.item_id)
+                got = ([detail["image"]["imageUrl"]] if detail.get("image") else []) + \
+                      [i["imageUrl"] for i in detail.get("additionalImages", [])]
+                urls = got or urls
+                lang = next((a.get("value") for a in detail.get("localizedAspects", [])
+                             if str(a.get("name", "")).lower() == "language"), None)
+                if lang and cfg.allowed_languages and not any(
+                        a.lower() in str(lang).lower() for a in cfg.allowed_languages):
+                    self.assessments.add_rule_fail(listing.item_id, f"auto-fail: Language is {lang!r}")
+                    log.info("auto-fail %s (Language=%r)", listing.item_id, lang)
+                    return
+            except EbayError as e:  # includes BudgetExhausted: fall back to the thumbnail
+                log.warning("getItem failed for %s (%s); using thumbnail only", listing.item_id, e)
+        urls = urls[:cfg.max_images]
+        if not urls:
+            return
+
+        paths = await self.images.download(listing.item_id, urls)
+        self.listings.record_images(listing.item_id, urls, paths)
+        good = [p for p in paths if p]
+        if not good:
+            log.warning("no images downloaded for %s", listing.item_id)
+            return
+
+        report = await self.analyzer.analyze(listing, good)
+        result = QualityPolicy(cfg.policy).evaluate(report)
+        self.assessments.add(listing.item_id, report, result)
+        log.info("%s -> %s %s", listing.item_id, result.verdict.value, result.reasons)
+
+        if result.verdict == Verdict.FAIL or self.notifications.exists(listing.item_id):
+            return
+        if result.verdict == Verdict.REVIEW and not cfg.policy.notify_review:
+            return
+        back_only = report.scope == "back_only"
+        tag = ("BACK OK" if back_only else "PASS") if result.verdict == Verdict.PASS else "REVIEW"
+        price = f"{listing.price:.2f} {listing.currency}" if listing.price is not None else "n/a"
+        cond = "back-only check, now look at the front" if back_only else report.overall.replace("_", " ")
+        lines = [f"{price} | {cond} | {len(good)} photos", report.summary]
+        if result.reasons:
+            lines.append("Check: " + "; ".join(result.reasons))
+        elif report.defects:
+            lines.append("Minor: " + "; ".join(f"{d.severity} {d.type.replace('_', ' ')}" for d in report.defects))
+        if report.unassessed_zones:
+            lines.append("Not checked (glare/obscured): " + ", ".join(report.unassessed_zones))
+        lines.append(listing.url or "")
+        await self.notifier.send(f"{tag}: {listing.title[:80]}", "\n".join(x for x in lines if x), listing.url)
+        self.notifications.mark(listing.item_id, "push")
+
+
+=== FILE: ./pokescan/pokescan/analysis/policy.py ===
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import Enum
+from pokescan.config.models import PolicyConfig
+from pokescan.domain.models import SEVERITY_ORDER
+from .base import ConditionReport
+
+
+class Verdict(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+    REVIEW = "review"   # photos unclear / model unsure -> a human should look
+
+
+@dataclass
+class PolicyResult:
+    verdict: Verdict
+    reasons: list[str] = field(default_factory=list)
+
+
+class QualityPolicy:
+    """Deterministic rules over the model's structured report. Tune in YAML, no re-analysis needed."""
+
+    def __init__(self, cfg: PolicyConfig):
+        self.cfg = cfg
+
+    def evaluate(self, r: ConditionReport) -> PolicyResult:
+        fails: list[str] = []
+        reviews: list[str] = []
+
+        if r.is_graded_slab and self.cfg.skip_graded:
+            return PolicyResult(Verdict.FAIL, ["graded slab"])
+
+        for d in r.defects:
+            if SEVERITY_ORDER[d.severity] > SEVERITY_ORDER[self.cfg.limit(d.type)]:
+                msg = f"{d.severity} {d.type.replace('_', ' ')} ({d.location or 'unspecified'}, conf {d.confidence:.2f})"
+                (fails if d.confidence >= self.cfg.min_confidence else reviews).append(msg)
+        if fails:
+            return PolicyResult(Verdict.FAIL, fails)
+
+        if not r.looks_authentic:
+            reviews.append("may be a proxy/custom/reprint")
+        if r.scope == "back_only":
+            if not r.back_visible:
+                reviews.append("no usable back photo (can't check whitening)")
+            elif r.image_quality == "insufficient":
+                reviews.append("photos insufficient to judge")
+        elif r.image_quality == "insufficient" or not r.front_visible:
+            reviews.append("photos insufficient to judge")
+        elif self.cfg.require_back_photo and not r.back_visible:
+            reviews.append("no back photo (can't check whitening)")
+        if len(r.unassessed_zones) > self.cfg.max_unassessed_zones:
+            reviews.append(f"glare/obstruction hides {len(r.unassessed_zones)} edge zones: {', '.join(r.unassessed_zones)}")
+        if r.overall == "unclear":
+            reviews.append("model could not determine condition")
+
+        if reviews:
+            return PolicyResult(Verdict.REVIEW, reviews)
+        return PolicyResult(Verdict.PASS, [])
+
+
+=== FILE: ./pokescan/pokescan/analysis/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/check.py ===
+"""Setup smoke test: python -m pokescan.check
+Verifies keys, runs ONE small live search per configured search (1 API call each), shows what eBay
+returns, and tries to read your real rate limit. Does not write listings to the database."""
+from __future__ import annotations
+import asyncio, os, sys
+from collections import Counter
+import httpx
+from dotenv import load_dotenv
+from pokescan.config.loader import ConfigLoader
+from pokescan.ebay.auth import EbayAuth
+from pokescan.ebay.client import EbayBrowseClient
+from pokescan.ebay.errors import EbayError
+from pokescan.ebay.query import build_params, expand_queries
+
+RATE_URL = "https://api.ebay.com/developer/analytics/v1_beta/rate_limit/"
+
+
+class _NoBudget:          # check runs aren't counted against the daily counter
+    def consume(self): ...
+
+
+async def main() -> int:
+    load_dotenv()
+    for k in ("EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET"):
+        if not os.getenv(k):
+            print(f"FAIL: {k} missing. Copy .env.example to .env and fill it in."); return 1
+    cfg = ConfigLoader(os.getenv("POKESCAN_CONFIG", "config/searches.yaml")).current()
+    print(f"Config OK: {len(cfg.searches)} searches, analysis={'on' if cfg.analysis.enabled else 'off'}")
+
+    async with httpx.AsyncClient(timeout=20) as http:
+        auth = EbayAuth(os.environ["EBAY_CLIENT_ID"], os.environ["EBAY_CLIENT_SECRET"], http)
+        try:
+            token = await auth.get_token()
+        except EbayError as e:
+            print(f"FAIL: token request rejected -> {e}\n  Use PRODUCTION keys (not Sandbox) and the App ID / Cert ID pair."); return 1
+        print("Token OK")
+
+        client = EbayBrowseClient(auth, http, _NoBudget(), cfg.global_.marketplace)
+        cats: Counter = Counter()
+        for s in cfg.searches:
+            if not s.enabled:
+                continue
+            q = expand_queries(s, cfg.global_)[0]
+            params = build_params(s, cfg.global_, q=q); params["limit"] = "20"
+            try:
+                page = await client.search(params)
+            except EbayError as e:
+                print(f"FAIL [{s.name}] {e}\n  params sent: {params}"); continue
+            print(f"[{s.name}] {page.total} total matches; first query: {q!r}")
+            for it in page.items[:3]:
+                price = f"{it.price.value:.2f} {it.price.currency}" if it.price else "n/a"
+                print(f"    {price:>12}  {it.title[:70]}")
+            for it in page.items:
+                for c in it.raw.get("categories", []):
+                    cats[(c.get("categoryId"), c.get("categoryName"))] += 1
+            if not page.items:
+                print("    (no results - loosen filters/set names, or check the category id)")
+
+        if cats:
+            print("Categories seen (confirm your category_ids):")
+            for (cid, name), n in cats.most_common(5):
+                print(f"    {cid}  {name}  x{n}")
+
+        first = next((x for x in cfg.searches if x.enabled), None)
+        if first:   # 1 extra call: ask eBay which item-specific names/values exist, so filters use real names
+            probe = build_params(first, cfg.global_, q=expand_queries(first, cfg.global_)[0])
+            probe.pop("aspect_filter", None); probe["limit"] = "1"; probe["fieldgroups"] = "ASPECT_REFINEMENTS"
+            try:
+                page = await client.search(probe)
+                print("Item specifics eBay offers for this search (use these exact names in aspect filters):")
+                for dist in page.refinement.get("aspectDistributions", []):
+                    name = dist.get("localizedAspectName", "")
+                    if any(k in name.lower() for k in ("year", "language", "set", "era", "game")):
+                        vals = ", ".join(f"{v.get('localizedAspectValueName')} ({v.get('matchCount')})"
+                                         for v in dist.get("aspectValueDistributions", [])[:8])
+                        print(f"    {name}: {vals}")
+            except EbayError as e:
+                print(f"(aspect probe failed: {e})")
+
+        try:
+            r = await http.get(RATE_URL, params={"api_context": "buy", "api_name": "browse"},
+                               headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 200:
+                for ctx in r.json().get("rateLimits", []):
+                    for res in ctx.get("resources", []):
+                        for rate in res.get("rates", []):
+                            print(f"Rate limit [{res.get('name')}]: {rate.get('count')} used / {rate.get('limit')} per {rate.get('timeDesc')}")
+            else:
+                print(f"(could not read rate limit: HTTP {r.status_code}; check Developer Portal > Analytics instead)")
+        except httpx.HTTPError as e:
+            print(f"(rate limit lookup skipped: {e})")
+    print("Done. If this looked right: python -m pokescan.main")
+    return 0
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    sys.exit(asyncio.run(main()))
+
+
+=== FILE: ./pokescan/pokescan/config/loader.py ===
+from __future__ import annotations
+import logging
+from pathlib import Path
+import yaml
+from pydantic import ValidationError
+from .models import AppConfig
+
+log = logging.getLogger(__name__)
+
+
+class ConfigLoader:
+    """Re-reads the YAML when its mtime changes. A bad edit never kills the daemon:
+    we log the error and keep serving the last good config."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._mtime: float | None = None
+        self._config: AppConfig | None = None
+
+    def current(self) -> AppConfig:
+        try:
+            mtime = self.path.stat().st_mtime
+            if mtime != self._mtime:
+                data = yaml.safe_load(self.path.read_text())
+                self._config = AppConfig.model_validate(data)
+                self._mtime = mtime
+                log.info("Loaded config: %d searches", len(self._config.searches))
+        except (OSError, yaml.YAMLError, ValidationError) as e:
+            if self._config is None:
+                raise  # nothing to fall back on at startup
+            try:
+                self._mtime = self.path.stat().st_mtime  # don't re-log every tick
+            except OSError:
+                pass
+            log.error("Config reload failed, keeping last good config: %s", e)
+        assert self._config is not None
+        return self._config
+
+
+=== FILE: ./pokescan/pokescan/config/models.py ===
+from __future__ import annotations
+from typing import Literal
+from pydantic import BaseModel, Field, model_validator
+from pokescan.domain.models import Severity
+
+Priority = Literal["high", "normal", "low"]
+
+
+class FilterConfig(BaseModel):
+    price_min: float | None = None
+    price_max: float | None = None
+    buying_options: list[Literal["FIXED_PRICE", "AUCTION", "BEST_OFFER"]] = []
+    conditions: list[Literal["NEW", "USED", "UNSPECIFIED"]] = []
+
+
+class SearchConfig(BaseModel):
+    name: str
+    enabled: bool = True
+    q: str = "pokemon"                     # base query; combined with each set name
+    sets: list[str] = []                   # e.g. [undaunted, call of legends]
+    set_batch_size: int = Field(3, ge=1)   # sets OR-ed into one API call (fewer calls)
+    exclude_terms: list[str] = []
+    filters: FilterConfig = FilterConfig()
+    priority: Priority = "normal"
+    category_ids: list[str] | None = None  # overrides global when set
+    languages: list[str] | None = None     # e.g. [English]; overrides global. [] = no language filter
+    years: list[int] = []                  # e.g. [1999, 2000]; can be combined with sets
+    year_match: Literal["aspect", "title"] | None = None   # overrides global
+
+
+class GlobalConfig(BaseModel):
+    daily_call_budget: int = 4000
+    marketplace: str = "EBAY_US"
+    category_ids: list[str] = []
+    languages: list[str] = []              # eBay item-specific 'Language' filter, e.g. [English]
+    page_size: int = Field(100, ge=1, le=200)
+    max_pages: int = Field(3, ge=1, le=10)          # pages per query; paging stops early at the first already-seen listing
+    year_match: Literal["aspect", "title"] = "aspect"  # aspect = eBay item-specific filter (drops blanks); title = year as a keyword
+    year_aspect_name: str = "Year Manufactured"     # verify with `python -m pokescan.check`
+    intervals_minutes: dict[Priority, float] = {"high": 5, "normal": 10, "low": 30}
+
+
+DEFAULT_LIMITS: dict[str, Severity] = {
+    "whitening": "minor", "edge_wear": "minor", "corner_wear": "minor", "scratch": "minor",
+    "crease": "none", "dent": "none", "stain": "none", "print_line": "moderate", "other": "moderate",
+}
+
+
+class PolicyConfig(BaseModel):
+    """Max tolerated severity per defect type. Anything worse FAILs (if the model is confident)."""
+    max_severity: dict[str, Severity] = {}      # partial overrides of DEFAULT_LIMITS
+    min_confidence: float = Field(0.6, ge=0, le=1)  # below this, a bad defect -> REVIEW not FAIL
+    require_back_photo: bool = True             # whitening shows best on the back border
+    skip_graded: bool = True                    # slabs hide edges; treat as FAIL
+    notify_review: bool = True                  # also ping for unclear photos / low confidence
+    max_unassessed_zones: int = 2               # of 8 edge/corner zones; more hidden by glare -> REVIEW
+
+    def limit(self, defect_type: str) -> Severity:
+        return {**DEFAULT_LIMITS, **self.max_severity}.get(defect_type, "moderate")
+
+
+class ClassicalConfig(BaseModel):
+    """Tunables for the OpenCV back-whitening analyzer. Calibrate on real listings using debug_dir."""
+    whitening_thresholds: tuple[float, float, float] = (0.03, 0.12, 0.30)  # fraction of whitish px: minor/moderate/major
+    band_pct: float = 0.03          # edge band depth as fraction of card width
+    inset_px: int = 3               # ignore the outermost px (contour imprecision / background leak)
+    white_s_max: int = 80           # whitening = low saturation ...
+    white_v_min: int = 150          # ... and bright (also adaptive vs. the card's own blue)
+    glare_v: int = 245              # glare core = blown-out pixels
+    glare_s: int = 40
+    glare_min_px: int = 15          # glare blobs are thicker than this; whitening is a thin line
+    glare_min_area: int = 500
+    glare_interior_px: int = 40     # real glare reaches into the card; blobs hugging the edge are treated as wear
+    glare_halo_px: int = 20         # grow the glare mask to cover its soft falloff
+    glare_zone_max: float = 0.35    # zone more than this covered by glare -> "not checked"
+    blur_min: float = 15.0          # variance of Laplacian below this -> low confidence
+    back_blue_min: float = 0.55     # share of border-ring pixels that must be blue to call a photo the BACK
+    debug_dir: str | None = None    # e.g. data/debug -> saves annotated images
+
+
+class AnalysisConfig(BaseModel):
+    enabled: bool = False
+    analyzer: Literal["claude", "classical"] = "claude"
+    model: str = "claude-sonnet-5-5"            # claude analyzer only
+    max_images: int = Field(4, ge=1, le=8)
+    fetch_all_photos: bool = True               # 1 getItem call per analyzed listing
+    max_analyses_per_day: int = 150             # hard spend cap
+    skip_title_terms: list[str] = []            # whole-word, case-insensitive; listing is ignored entirely
+    allowed_languages: list[str] = []           # if a listing's Language item-specific is set and not one of these -> auto-FAIL. Blank passes.
+    auto_fail_title_terms: list[str] = ["japanese", "japan", "jpn", "jp", "日本語", "日本"]  # recorded as FAIL, no photos/API spent
+    classical: ClassicalConfig = ClassicalConfig()
+    policy: PolicyConfig = PolicyConfig()
+
+
+class AppConfig(BaseModel):
+    global_: GlobalConfig = Field(default_factory=GlobalConfig, alias="global")
+    searches: list[SearchConfig]
+    analysis: AnalysisConfig = AnalysisConfig()
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def unique_names(self):
+        names = [s.name for s in self.searches]
+        if len(names) != len(set(names)):
+            raise ValueError("search names must be unique")
+        return self
+
+
+=== FILE: ./pokescan/pokescan/config/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/domain/models.py ===
+from __future__ import annotations
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Listing:
+    item_id: str
+    title: str
+    price: float | None
+    currency: str
+    url: str | None
+    image_url: str | None
+    seller: str | None
+    buying_options: tuple[str, ...] = ()
+    created_at: str | None = None
+    search_name: str = ""
+
+
+from typing import Literal  # noqa: E402
+
+Severity = Literal["none", "minor", "moderate", "major"]
+SEVERITY_ORDER = {"none": 0, "minor": 1, "moderate": 2, "major": 3}
+
+
+=== FILE: ./pokescan/pokescan/domain/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/ebay/auth.py ===
+from __future__ import annotations
+import asyncio, base64, time
+import httpx
+from .errors import AuthError
+
+TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+SCOPE = "https://api.ebay.com/oauth/api_scope"
+
+
+class EbayAuth:
+    """Client-credentials (application) token, cached and refreshed ~5 min before expiry."""
+
+    def __init__(self, client_id: str, client_secret: str, http: httpx.AsyncClient):
+        self._basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        self._http = http
+        self._token: str | None = None
+        self._expires_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def get_token(self) -> str:
+        async with self._lock:
+            if self._token and time.time() < self._expires_at - 300:
+                return self._token
+            resp = await self._http.post(
+                TOKEN_URL,
+                headers={"Authorization": f"Basic {self._basic}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type": "client_credentials", "scope": SCOPE},
+            )
+            if resp.status_code != 200:
+                raise AuthError(f"Token request failed: {resp.status_code} {resp.text[:200]}")
+            body = resp.json()
+            self._token = body["access_token"]
+            self._expires_at = time.time() + int(body.get("expires_in", 7200))
+            return self._token
+
+    def invalidate(self) -> None:
+        self._token = None
+
+
+=== FILE: ./pokescan/pokescan/ebay/client.py ===
+from __future__ import annotations
+import asyncio, logging
+import httpx
+from .auth import EbayAuth
+from .errors import EbayError, RateLimited
+from .models import ItemSummary, SearchPage
+
+log = logging.getLogger(__name__)
+BASE = "https://api.ebay.com/buy/browse/v1"
+
+
+class EbayBrowseClient:
+    def __init__(self, auth: EbayAuth, http: httpx.AsyncClient, budget, marketplace: str = "EBAY_US"):
+        self._auth, self._http, self._budget, self._mkt = auth, http, budget, marketplace
+
+    async def _get(self, path: str, params: dict | None = None) -> dict:
+        reauthed = False
+        for attempt in range(4):
+            self._budget.consume()  # raises BudgetExhausted before we ever exceed the cap
+            token = await self._auth.get_token()
+            try:
+                r = await self._http.get(
+                    f"{BASE}{path}", params=params,
+                    headers={"Authorization": f"Bearer {token}",
+                             "X-EBAY-C-MARKETPLACE-ID": self._mkt},
+                )
+            except httpx.TransportError as e:
+                log.warning("Network error (%s), retry %d", e, attempt)
+                await asyncio.sleep(2 ** attempt)
+                continue
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 401 and not reauthed:
+                self._auth.invalidate(); reauthed = True
+                continue
+            if r.status_code == 429:
+                raise RateLimited(r.text[:200])
+            if r.status_code >= 500:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise EbayError(f"{r.status_code}: {r.text[:300]}")
+        raise EbayError(f"Gave up on {path} after retries")
+
+    async def search(self, params: dict[str, str]) -> SearchPage:
+        body = await self._get("/item_summary/search", params)
+        items = []
+        for raw in body.get("itemSummaries", []):
+            item = ItemSummary.model_validate(raw)
+            item.raw = raw
+            items.append(item)
+        return SearchPage(items=items, total=body.get("total", 0), next_url=body.get("next"),
+                          refinement=body.get("refinement", {}))
+
+    async def get_item(self, item_id: str) -> dict:
+        """Full item detail (all photos live here). Costs 1 call; use sparingly."""
+        return await self._get(f"/item/{item_id}")
+
+
+=== FILE: ./pokescan/pokescan/ebay/errors.py ===
+class EbayError(Exception): ...
+class AuthError(EbayError): ...
+class RateLimited(EbayError): ...
+class BudgetExhausted(EbayError): ...
+
+
+=== FILE: ./pokescan/pokescan/ebay/models.py ===
+from __future__ import annotations
+from typing import Any
+from pydantic import BaseModel, Field
+
+
+class Price(BaseModel):
+    value: float
+    currency: str = "USD"
+
+
+class Image(BaseModel):
+    imageUrl: str
+
+
+class Seller(BaseModel):
+    username: str | None = None
+    feedbackPercentage: str | None = None
+    feedbackScore: int | None = None
+
+
+class ItemSummary(BaseModel):
+    """One element of itemSummaries in Browse search. Unknown fields are ignored."""
+    itemId: str
+    title: str
+    price: Price | None = None
+    image: Image | None = None
+    additionalImages: list[Image] = []
+    itemWebUrl: str | None = None
+    seller: Seller | None = None
+    buyingOptions: list[str] = []
+    condition: str | None = None
+    itemCreationDate: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+
+class SearchPage(BaseModel):
+    items: list[ItemSummary]
+    total: int = 0
+    next_url: str | None = None
+    refinement: dict[str, Any] = {}
+
+
+=== FILE: ./pokescan/pokescan/ebay/query.py ===
+from __future__ import annotations
+import re
+from pokescan.config.models import GlobalConfig, SearchConfig
+
+
+def _term(t: str) -> str:
+    return f'"{t}"' if " " in t.strip() else t.strip()
+
+
+def _year_mode(search: SearchConfig, g: GlobalConfig | None) -> str:
+    return search.year_match or (g.year_match if g else "aspect")
+
+
+def expand_queries(search: SearchConfig, g: GlobalConfig | None = None) -> list[str]:
+    """One query string per batch of sets, e.g. 'pokemon ("call of legends", undaunted)'.
+    No sets -> just the base query. In year_match=title mode the years are appended as a second
+    OR-group. Each string costs one API call per poll (per page)."""
+    year_group = ""
+    if search.years and _year_mode(search, g) == "title":
+        ys = ", ".join(str(y) for y in search.years)
+        year_group = f" ({ys})" if len(search.years) > 1 else f" {ys}"
+    if not search.sets:
+        return [search.q + year_group]
+    n = search.set_batch_size
+    out = []
+    for i in range(0, len(search.sets), n):
+        chunk = [_term(x) for x in search.sets[i:i + n]]
+        base = f"{search.q} {chunk[0]}" if len(chunk) == 1 else f"{search.q} ({', '.join(chunk)})"
+        out.append(base + year_group)
+    return out
+
+
+def build_params(search: SearchConfig, g: GlobalConfig, offset: int = 0, q: str | None = None) -> dict[str, str]:
+    """SearchConfig -> Browse API query params."""
+    f = search.filters
+    parts: list[str] = []
+    if f.price_min is not None or f.price_max is not None:
+        lo = "" if f.price_min is None else f"{f.price_min:g}"
+        hi = "" if f.price_max is None else f"{f.price_max:g}"
+        parts.append(f"price:[{lo}..{hi}]" if hi else f"price:[{lo}]")
+        parts.append("priceCurrency:USD")
+    if f.buying_options:
+        parts.append("buyingOptions:{" + "|".join(f.buying_options) + "}")
+    if f.conditions:
+        parts.append("conditions:{" + "|".join(f.conditions) + "}")
+
+    params = {"q": q or search.q, "sort": "newlyListed",
+              "limit": str(g.page_size), "offset": str(offset)}
+    cats = search.category_ids or g.category_ids
+    if cats:
+        params["category_ids"] = ",".join(cats)
+    if parts:
+        params["filter"] = ",".join(parts)
+
+    aspects: list[str] = []
+    langs = g.languages if search.languages is None else search.languages
+    if langs:
+        aspects.append(f"Language:{{{'|'.join(langs)}}}")
+    if search.years and _year_mode(search, g) == "aspect":
+        aspects.append(f"{g.year_aspect_name}:{{{'|'.join(str(y) for y in search.years)}}}")
+    if aspects:
+        if len(cats) != 1:
+            raise ValueError(f"[{search.name}] language/year aspect filters need exactly one category id (eBay requirement)")
+        params["aspect_filter"] = f"categoryId:{cats[0]}," + ",".join(aspects)
+    return params
+
+
+def full_res(url: str) -> str:
+    """eBay image URLs embed a size (s-l225.jpg). Swap for the 1600px variant, no API call."""
+    return re.sub(r"s-l\d+", "s-l1600", url)
+
+
+=== FILE: ./pokescan/pokescan/ebay/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/main.py ===
+from __future__ import annotations
+import asyncio, logging, os, signal, sys
+import httpx
+from dotenv import load_dotenv
+
+from pokescan.analysis.claude_vision import ClaudeVisionAnalyzer
+from pokescan.analysis.handler import AnalysisHandler
+from pokescan.config.loader import ConfigLoader
+from pokescan.ebay.auth import EbayAuth
+from pokescan.ebay.client import EbayBrowseClient
+from pokescan.notify.handlers import ConsoleNotifier, NtfyNotifier
+from pokescan.pipeline.budget import RateBudget
+from pokescan.pipeline.poller import SearchPoller
+from pokescan.pipeline.scheduler import Scheduler
+from pokescan.storage import db
+from pokescan.storage.image_store import ImageStore
+from pokescan.storage.repositories import (AssessmentRepository, ListingRepository,
+                                            NotificationRepository, PollRunRepository, UsageRepository)
+
+
+async def amain() -> None:
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    loader = ConfigLoader(os.getenv("POKESCAN_CONFIG", "config/searches.yaml"))
+    cfg = loader.current()
+    conn = db.connect(os.getenv("POKESCAN_DB", "data/pokescan.db"))
+    budget = RateBudget(UsageRepository(conn), cfg.global_.daily_call_budget)
+    listings = ListingRepository(conn)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as http:
+        auth = EbayAuth(os.environ["EBAY_CLIENT_ID"], os.environ["EBAY_CLIENT_SECRET"], http)
+        client = EbayBrowseClient(auth, http, budget, cfg.global_.marketplace)
+        poller = SearchPoller(client, listings, PollRunRepository(conn))
+
+        push = NtfyNotifier(os.environ["NTFY_TOPIC"], http) if os.getenv("NTFY_TOPIC") else ConsoleNotifier()
+        handlers: list = [ConsoleNotifier()]  # logs every new listing to the console
+        worker: asyncio.Task | None = None
+
+        if cfg.analysis.enabled:
+            if cfg.analysis.analyzer == "classical":
+                from pokescan.analysis.classical import ClassicalAnalyzer  # lazy: needs opencv
+                analyzer = ClassicalAnalyzer(lambda: loader.current().analysis.classical)  # hot-reloadable
+            else:
+                if not os.getenv("ANTHROPIC_API_KEY"):
+                    raise SystemExit("analyzer is 'claude' but ANTHROPIC_API_KEY is not set")
+                analyzer = ClaudeVisionAnalyzer(cfg.analysis.model)
+            analysis = AnalysisHandler(
+                loader, client, ImageStore(http), analyzer, push,
+                listings, AssessmentRepository(conn), NotificationRepository(conn))
+            handlers.append(analysis)
+            worker = asyncio.create_task(analysis.run())
+        elif os.getenv("NTFY_TOPIC"):
+            handlers.append(push)  # Phase 1 behaviour: push every new listing
+
+        sched = Scheduler(loader, poller, budget, handlers)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, sched.stop)
+            except NotImplementedError:   # Windows event loops don't support this; Ctrl+C is handled in __main__
+                pass
+        try:
+            await sched.run()
+        finally:
+            if worker:
+                worker.cancel()
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):   # Windows consoles default to a legacy codepage; titles can contain Japanese/emoji
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        print("Stopped.")
+
+
+=== FILE: ./pokescan/pokescan/notify/handlers.py ===
+import logging
+import httpx
+from pokescan.domain.models import Listing
+
+log = logging.getLogger(__name__)
+
+
+def _fmt(l: Listing) -> str:
+    price = f"{l.price:.2f} {l.currency}" if l.price is not None else "n/a"
+    return f"[{l.search_name}] {l.title} - {price}\n{l.url}"
+
+
+class ConsoleNotifier:
+    async def handle(self, listing: Listing) -> None:      # ListingHandler (every new listing)
+        print("NEW:", _fmt(listing), flush=True)
+
+    async def send(self, title: str, body: str, url: str | None = None) -> None:  # Notifier
+        print(f"\n== {title} ==\n{body}\n", flush=True)
+
+
+class NtfyNotifier:
+    """Phone push via ntfy.sh (or your self-hosted server)."""
+
+    def __init__(self, topic: str, http: httpx.AsyncClient, server: str = "https://ntfy.sh"):
+        self.url, self.http = f"{server}/{topic}", http
+
+    async def send(self, title: str, body: str, url: str | None = None) -> None:
+        headers = {"Title": title.encode("ascii", "ignore").decode()[:100] or "pokescan"}
+        if url:
+            headers["Click"] = url
+        try:
+            await self.http.post(self.url, content=body.encode(), headers=headers)
+        except httpx.HTTPError as e:
+            log.warning("ntfy failed: %s", e)
+
+    async def handle(self, listing: Listing) -> None:
+        await self.send(listing.title, _fmt(listing), listing.url)
+
+
+=== FILE: ./pokescan/pokescan/notify/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/pipeline/budget.py ===
+from pokescan.ebay.errors import BudgetExhausted
+
+
+class RateBudget:
+    """Persistent daily call counter. daily_limit is mutable so hot-reloaded config can change it."""
+
+    def __init__(self, usage_repo, daily_limit: int):
+        self.usage, self.daily_limit = usage_repo, daily_limit
+
+    def remaining(self) -> int:
+        return max(0, self.daily_limit - self.usage.calls_today())
+
+    def consume(self) -> None:
+        if self.remaining() <= 0:
+            raise BudgetExhausted(f"Daily budget of {self.daily_limit} calls used")
+        self.usage.increment()
+
+
+=== FILE: ./pokescan/pokescan/pipeline/filters.py ===
+from pokescan.config.models import SearchConfig
+from pokescan.ebay.models import ItemSummary
+
+
+def passes(item: ItemSummary, search: SearchConfig) -> bool:
+    title = item.title.lower()
+    return not any(term.lower() in title for term in search.exclude_terms)
+
+
+=== FILE: ./pokescan/pokescan/pipeline/poller.py ===
+from __future__ import annotations
+import logging
+from pokescan.config.models import GlobalConfig, SearchConfig
+from pokescan.domain.models import Listing
+from pokescan.ebay.query import build_params, expand_queries
+from . import filters
+
+log = logging.getLogger(__name__)
+
+
+class SearchPoller:
+    def __init__(self, client, listings, runs):
+        self.client, self.listings, self.runs = client, listings, runs
+
+    async def poll(self, search: SearchConfig, g: GlobalConfig) -> list[Listing]:
+        """Walk each query newest-first, up to g.max_pages pages, stopping as soon as a page contains
+        a listing we already had (everything after it is older). Returns only NEW listings.
+        On a search's very first run we seed the DB silently so you aren't spammed with the
+        entire current inventory."""
+        seed = not self.listings.search_has_history(search.name)
+        fetched = new = calls = 0
+        new_ids: set[str] = set()
+        try:
+            fresh: list[Listing] = []
+            for q in expand_queries(search, g):
+                for page_no in range(g.max_pages):
+                    page = await self.client.search(build_params(search, g, offset=page_no * g.page_size, q=q))
+                    calls += 1
+                    saw_old = False
+                    for item in page.items:
+                        if not filters.passes(item, search):
+                            continue
+                        fetched += 1
+                        listing, is_new = self.listings.upsert(search.name, item)
+                        if is_new:
+                            new += 1
+                            new_ids.add(item.itemId)
+                            fresh.append(listing)
+                        elif item.itemId not in new_ids:   # genuinely seen before this poll
+                            saw_old = True
+                    if saw_old or len(page.items) < g.page_size or not page.next_url:
+                        break
+            self.runs.record(search.name, calls, fetched, new)
+            if seed:
+                log.info("[%s] seeded %d existing listings", search.name, fetched)
+                return []
+            return fresh
+        except Exception as e:
+            self.runs.record(search.name, calls, fetched, new, error=repr(e))
+            raise
+
+
+=== FILE: ./pokescan/pokescan/pipeline/scheduler.py ===
+from __future__ import annotations
+import asyncio, logging, time
+from typing import Protocol
+from pokescan.domain.models import Listing
+from pokescan.ebay.errors import BudgetExhausted, EbayError
+
+log = logging.getLogger(__name__)
+
+
+class ListingHandler(Protocol):
+    async def handle(self, listing: Listing) -> None: ...
+
+
+class Scheduler:
+    """Ticks every few seconds; runs each enabled search when its priority interval elapses.
+    Config is re-read every tick, so YAML edits apply within seconds."""
+
+    def __init__(self, loader, poller, budget, handlers: list[ListingHandler], tick_seconds: float = 5):
+        self.loader, self.poller, self.budget = loader, poller, budget
+        self.handlers, self.tick = handlers, tick_seconds
+        self._last_run: dict[str, float] = {}
+        self._stop = asyncio.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def run(self) -> None:
+        while not self._stop.is_set():
+            cfg = self.loader.current()
+            self.budget.daily_limit = cfg.global_.daily_call_budget
+            now = time.monotonic()
+            for s in cfg.searches:
+                if not s.enabled:
+                    continue
+                interval = cfg.global_.intervals_minutes[s.priority] * 60
+                if now - self._last_run.get(s.name, -1e9) < interval:
+                    continue
+                self._last_run[s.name] = now
+                try:
+                    for listing in await self.poller.poll(s, cfg.global_):
+                        for h in self.handlers:
+                            await h.handle(listing)
+                except BudgetExhausted as e:
+                    log.warning("%s - pausing polls until budget resets (UTC midnight)", e)
+                    break
+                except EbayError as e:
+                    log.error("[%s] eBay error: %s", s.name, e)
+                except Exception:
+                    log.exception("[%s] unexpected error", s.name)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.tick)
+            except asyncio.TimeoutError:
+                pass
+
+
+=== FILE: ./pokescan/pokescan/pipeline/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/storage/db.py ===
+import sqlite3
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS listings (
+  item_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  price REAL, currency TEXT,
+  url TEXT, seller TEXT, buying_options TEXT,
+  created_at TEXT,
+  first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  last_seen_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  raw_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_listings_first_seen ON listings(first_seen_at);
+
+CREATE TABLE IF NOT EXISTS listing_images (
+  item_id TEXT NOT NULL REFERENCES listings(item_id),
+  position INTEGER NOT NULL,
+  url TEXT NOT NULL,
+  local_path TEXT,                       -- filled in Phase 2
+  PRIMARY KEY (item_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS listing_matches (
+  item_id TEXT NOT NULL REFERENCES listings(item_id),
+  search_name TEXT NOT NULL,
+  matched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (item_id, search_name)
+);
+
+CREATE TABLE IF NOT EXISTS poll_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  search_name TEXT NOT NULL,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  calls INTEGER NOT NULL DEFAULT 0,
+  fetched INTEGER NOT NULL DEFAULT 0,
+  new_listings INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_usage (
+  day TEXT PRIMARY KEY,                  -- UTC date
+  calls INTEGER NOT NULL DEFAULT 0
+);
+
+-- Phase 2 (created now so migrations stay trivial)
+CREATE TABLE IF NOT EXISTS assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id TEXT NOT NULL REFERENCES listings(item_id),
+  model TEXT, grade TEXT, verdict TEXT, defects_json TEXT, confidence REAL, cost_usd REAL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS notifications (
+  item_id TEXT PRIMARY KEY REFERENCES listings(item_id),
+  channel TEXT, sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+"""
+
+
+def connect(path: str | Path) -> sqlite3.Connection:
+    if str(path) != ":memory:":
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(assessments)")}
+    if "verdict" not in cols:  # migrate DBs created by Phase 1
+        conn.execute("ALTER TABLE assessments ADD COLUMN verdict TEXT")
+    return conn
+
+
+=== FILE: ./pokescan/pokescan/storage/image_store.py ===
+from __future__ import annotations
+import logging
+from pathlib import Path
+import httpx
+from pokescan.ebay.query import full_res
+
+log = logging.getLogger(__name__)
+
+
+class ImageStore:
+    """Downloads listing photos to data/images/<item_id>/<n>.<ext>.
+    Image CDN fetches do NOT count against the eBay API budget."""
+
+    def __init__(self, http: httpx.AsyncClient, root: str | Path = "data/images"):
+        self.http, self.root = http, Path(root)
+
+    async def download(self, item_id: str, urls: list[str]) -> list[Path | None]:
+        """Returns a list aligned with urls (None where a download failed)."""
+        safe = item_id.replace("|", "_").replace("/", "_")
+        folder = self.root / safe
+        folder.mkdir(parents=True, exist_ok=True)
+        out: list[Path | None] = []
+        for i, url in enumerate(urls):
+            saved = None
+            for candidate in dict.fromkeys([full_res(url), url]):  # try 1600px, fall back to original
+                try:
+                    r = await self.http.get(candidate, follow_redirects=True)
+                except httpx.HTTPError as e:
+                    log.warning("image fetch error %s: %s", candidate, e)
+                    continue
+                ct = r.headers.get("content-type", "")
+                if r.status_code == 200 and r.content and ct.startswith("image/"):
+                    ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
+                    saved = folder / f"{i}{ext}"
+                    saved.write_bytes(r.content)
+                    break
+            out.append(saved)
+        return out
+
+
+=== FILE: ./pokescan/pokescan/storage/repositories.py ===
+from __future__ import annotations
+import json, sqlite3
+from datetime import datetime, timezone
+from pokescan.domain.models import Listing
+from pokescan.ebay.models import ItemSummary
+
+
+class ListingRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def search_has_history(self, search_name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM listing_matches WHERE search_name=? LIMIT 1", (search_name,)).fetchone()
+        return row is not None
+
+    def upsert(self, search_name: str, item: ItemSummary) -> tuple[Listing, bool]:
+        """Returns (listing, is_new). New == item_id not previously in the table."""
+        existed = self.conn.execute(
+            "SELECT 1 FROM listings WHERE item_id=?", (item.itemId,)).fetchone() is not None
+        price = item.price.value if item.price else None
+        currency = item.price.currency if item.price else None
+        seller = item.seller.username if item.seller else None
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO listings (item_id,title,price,currency,url,seller,buying_options,created_at,raw_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(item_id) DO UPDATE SET
+                     last_seen_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                     price=excluded.price, title=excluded.title, raw_json=excluded.raw_json""",
+                (item.itemId, item.title, price, currency, item.itemWebUrl, seller,
+                 ",".join(item.buyingOptions), item.itemCreationDate, json.dumps(item.raw)))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO listing_matches (item_id, search_name) VALUES (?,?)",
+                (item.itemId, search_name))
+            images = ([item.image] if item.image else []) + list(item.additionalImages)
+            for pos, img in enumerate(images):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO listing_images (item_id, position, url) VALUES (?,?,?)",
+                    (item.itemId, pos, img.imageUrl))
+        listing = Listing(
+            item_id=item.itemId, title=item.title, price=price, currency=currency or "USD",
+            url=item.itemWebUrl, image_url=item.image.imageUrl if item.image else None,
+            seller=seller, buying_options=tuple(item.buyingOptions),
+            created_at=item.itemCreationDate, search_name=search_name)
+        return listing, not existed
+
+
+    def record_images(self, item_id: str, urls: list[str], paths: list) -> None:
+        with self.conn:
+            for pos, (u, path) in enumerate(zip(urls, paths)):
+                self.conn.execute(
+                    "INSERT INTO listing_images (item_id, position, url, local_path) VALUES (?,?,?,?) "
+                    "ON CONFLICT(item_id, position) DO UPDATE SET url=excluded.url, local_path=excluded.local_path",
+                    (item_id, pos, u, str(path) if path else None))
+
+
+class AssessmentRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def count_today(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM assessments WHERE substr(created_at,1,10)=strftime('%Y-%m-%d','now')"
+        ).fetchone()[0]
+
+    def has_assessment(self, item_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM assessments WHERE item_id=?", (item_id,)).fetchone() is not None
+
+    def add_rule_fail(self, item_id: str, reason: str) -> None:
+        """Record an automatic FAIL decided from listing metadata (no photos fetched, no model call)."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO assessments (item_id, model, grade, verdict, defects_json) VALUES (?,?,?,?,?)",
+                (item_id, "rule", "n/a", "fail", json.dumps({"verdict": "fail", "reasons": [reason]})))
+
+    def add(self, item_id: str, report, result) -> None:
+        payload = {"report": report.model_dump(), "verdict": result.verdict.value, "reasons": result.reasons}
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO assessments (item_id, model, grade, verdict, defects_json, confidence) VALUES (?,?,?,?,?,?)",
+                (item_id, report.model, report.overall, result.verdict.value, json.dumps(payload),
+                 min((d.confidence for d in report.defects), default=None)))
+
+
+class NotificationRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def exists(self, item_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM notifications WHERE item_id=?", (item_id,)).fetchone() is not None
+
+    def mark(self, item_id: str, channel: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO notifications (item_id, channel) VALUES (?,?)", (item_id, channel))
+
+
+class PollRunRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def record(self, search_name: str, calls: int, fetched: int, new: int, error: str | None = None):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO poll_runs (search_name,calls,fetched,new_listings,error) VALUES (?,?,?,?,?)",
+                (search_name, calls, fetched, new, error))
+
+
+class UsageRepository:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def calls_today(self) -> int:
+        row = self.conn.execute("SELECT calls FROM api_usage WHERE day=?", (self._today(),)).fetchone()
+        return row["calls"] if row else 0
+
+    def increment(self) -> int:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO api_usage (day, calls) VALUES (?,1) "
+                "ON CONFLICT(day) DO UPDATE SET calls=calls+1", (self._today(),))
+        return self.calls_today()
+
+
+=== FILE: ./pokescan/pokescan/storage/__init__.py ===
+
+
+=== FILE: ./pokescan/pokescan/__init__.py ===
+
+
+=== FILE: ./pokescan/tests/test_classical.py ===
+import asyncio
+import cv2, numpy as np, pytest
+from pokescan.analysis.classical import ClassicalAnalyzer, W, H, CORNER_R
+from pokescan.analysis.policy import QualityPolicy, Verdict
+from pokescan.config.models import ClassicalConfig, PolicyConfig
+from pokescan.domain.models import Listing
+
+rng = np.random.default_rng(0)
+LISTING = Listing(item_id="v1|1|0", title="t", price=1.0, currency="USD", url=None, image_url=None, seller=None)
+
+
+def card_img(front=False, whiten=None):
+    c = np.zeros((H, W, 3), np.uint8)
+    border, center = ((40, 200, 230), (200, 160, 120)) if front else ((120, 50, 15), (190, 110, 40))
+    c[:] = border
+    c[90:790, 70:560] = center
+    cv2.circle(c, (W // 2, H // 2), 120, (60, 60, 220), -1)
+    for side, (ys, xs) in (whiten or {}).items():       # whitening: speckled pale pixels on the outer edge
+        patch = c[ys, xs]
+        m = rng.random(patch.shape[:2]) < 0.8
+        patch[m] = (222, 224, 226)
+        c[ys, xs] = patch
+    return c
+
+
+def canvas(card, glare=None, bg=(95, 120, 100), skew=1.0):
+    cw, ch = 1100, 1300
+    src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+    dst = np.float32([[240, 160], [860, 150 + 30 * skew], [850, 1070], [225, 1040 - 10 * skew]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    bgimg = np.full((ch, cw, 3), bg, np.uint8)
+    mask = np.zeros((H, W), np.uint8)                   # rounded card mask
+    cv2.rectangle(mask, (CORNER_R, 0), (W - CORNER_R - 1, H - 1), 255, -1)
+    cv2.rectangle(mask, (0, CORNER_R), (W - 1, H - CORNER_R - 1), 255, -1)
+    for x, y in [(CORNER_R, CORNER_R), (W - CORNER_R - 1, CORNER_R), (CORNER_R, H - CORNER_R - 1), (W - CORNER_R - 1, H - CORNER_R - 1)]:
+        cv2.circle(mask, (x, y), CORNER_R, 255, -1)
+    wc = cv2.warpPerspective(card, M, (cw, ch))
+    wm = cv2.warpPerspective(mask, M, (cw, ch)) > 127
+    img = bgimg.copy(); img[wm] = wc[wm]
+    if glare:                                           # list of (cx, cy, radius): blown-out soft blob
+        a = np.zeros((ch, cw), np.float32)
+        for cx, cy, r in glare:
+            cv2.circle(a, (cx, cy), r, 1.0, -1)
+        a = np.clip(cv2.GaussianBlur(a, (0, 0), 8) * 1.4, 0, 1)[..., None]
+        img = (img * (1 - a) + 255 * a).astype(np.uint8)
+    img = np.clip(img.astype(np.float32) + rng.normal(0, 3, img.shape), 0, 255).astype(np.uint8)
+    return img
+
+
+def save(tmp_path, name, img):
+    p = tmp_path / name
+    cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return p
+
+
+def run(paths, **cfg):
+    rep = asyncio.run(ClassicalAnalyzer(ClassicalConfig(**cfg)).analyze(LISTING, paths))
+    return rep, QualityPolicy(PolicyConfig()).evaluate(rep)
+
+
+TOP_WHITE = {"top": (slice(0, 7), slice(60, 570))}
+BOTTOM_WHITE = {"bottom": (slice(H - 7, H), slice(60, 570))}
+TL_GLARE = [(262, 190, 95)]   # over the top-left corner, reaching into the card interior
+
+
+def test_clean_back_passes(tmp_path):
+    rep, res = run([save(tmp_path, "a.jpg", canvas(card_img()))])
+    assert rep.back_visible and rep.scope == "back_only" and not rep.defects and not rep.unassessed_zones, rep.summary
+    assert res.verdict == Verdict.PASS
+
+
+def test_whitened_edge_fails(tmp_path):
+    rep, res = run([save(tmp_path, "a.jpg", canvas(card_img(whiten=TOP_WHITE)))])
+    assert any(d.location == "top" and d.severity in ("moderate", "major") for d in rep.defects), rep.summary
+    assert res.verdict == Verdict.FAIL
+
+
+def test_glare_alone_never_fails(tmp_path):
+    rep, res = run([save(tmp_path, "a.jpg", canvas(card_img(), glare=TL_GLARE))])
+    assert not rep.defects, rep.summary
+    assert "top-left" in rep.unassessed_zones
+    assert res.verdict != Verdict.FAIL
+
+
+def test_glare_does_not_excuse_real_whitening(tmp_path):
+    rep, res = run([save(tmp_path, "a.jpg", canvas(card_img(whiten=BOTTOM_WHITE), glare=TL_GLARE))])
+    assert any(d.location == "bottom" for d in rep.defects), rep.summary
+    assert res.verdict == Verdict.FAIL
+
+
+def test_glare_zone_recovered_from_second_photo(tmp_path):
+    a = save(tmp_path, "a.jpg", canvas(card_img(), glare=TL_GLARE))
+    b = save(tmp_path, "b.jpg", canvas(card_img(), skew=0.5))
+    rep, res = run([a, b])
+    assert rep.unassessed_zones == [] and res.verdict == Verdict.PASS
+
+
+def test_front_photo_goes_to_review(tmp_path):
+    rep, res = run([save(tmp_path, "f.jpg", canvas(card_img(front=True)))])
+    assert not rep.back_visible and res.verdict == Verdict.REVIEW
+
+
+def test_no_card_goes_to_review(tmp_path):
+    blank = np.full((900, 700, 3), 120, np.uint8)
+    rep, res = run([save(tmp_path, "x.jpg", blank)])
+    assert rep.image_quality == "insufficient" and res.verdict == Verdict.REVIEW
+
+
+def test_debug_images_written(tmp_path):
+    run([save(tmp_path, "a.jpg", canvas(card_img(whiten=BOTTOM_WHITE), glare=TL_GLARE))], debug_dir=str(tmp_path / "dbg"))
+    assert list((tmp_path / "dbg").rglob("*_zones.jpg"))
+
+
+def test_untrustworthy_outline_never_clears(tmp_path):
+    """Glare on the same corner as edge whitening can break card localization. Whatever happens,
+    the card must not be cleared as PASS."""
+    rep, res = run([save(tmp_path, "a.jpg", canvas(card_img(whiten=TOP_WHITE), glare=TL_GLARE))])
+    assert res.verdict != Verdict.PASS
+
+
+=== FILE: ./pokescan/tests/test_offline.py ===
+import json
+from pokescan.config.models import AppConfig
+from pokescan.ebay.models import ItemSummary
+from pokescan.ebay.query import build_params, full_res
+from pokescan.storage import db
+from pokescan.storage.repositories import ListingRepository, UsageRepository
+from pokescan.pipeline.budget import RateBudget
+from pokescan.ebay.errors import BudgetExhausted
+import pytest, yaml, pathlib
+
+cfg = AppConfig.model_validate(yaml.safe_load(pathlib.Path("config/searches.yaml").read_text()))
+
+def test_query():
+    p = build_params(cfg.searches[0], cfg.global_)
+    assert p["sort"] == "newlyListed"
+    assert "price:[" in p["filter"] and "buyingOptions:{" in p["filter"]
+    assert p["category_ids"] == "183454"
+
+def test_full_res():
+    assert full_res("https://i.ebayimg.com/images/g/abc/s-l225.jpg").endswith("s-l1600.jpg")
+
+def test_upsert_dedup():
+    conn = db.connect(":memory:")
+    repo = ListingRepository(conn)
+    raw = {"itemId": "v1|1|0", "title": "Charizard Base Set", "price": {"value": "99.5", "currency": "USD"},
+           "image": {"imageUrl": "https://i.ebayimg.com/x/s-l225.jpg"}, "itemWebUrl": "http://x"}
+    item = ItemSummary.model_validate(raw); item.raw = raw
+    assert repo.upsert("s", item)[1] is True
+    assert repo.upsert("s", item)[1] is False
+
+def test_budget():
+    conn = db.connect(":memory:")
+    b = RateBudget(UsageRepository(conn), 2)
+    b.consume(); b.consume()
+    with pytest.raises(BudgetExhausted):
+        b.consume()
+
+
+def test_expand_sets():
+    from pokescan.ebay.query import expand_queries
+    from pokescan.config.models import SearchConfig
+    sc = SearchConfig(name="x", sets=["undaunted", "call of legends", "unleashed", "triumphant"], set_batch_size=3)
+    assert expand_queries(sc) == ['pokemon (undaunted, "call of legends", unleashed)', "pokemon triumphant"]
+
+
+def test_language_filter():
+    from pokescan.config.models import SearchConfig, GlobalConfig
+    g = GlobalConfig(category_ids=["183454"], languages=["English"])
+    p = build_params(SearchConfig(name="x", sets=["jungle"]), g)
+    assert p["aspect_filter"] == "categoryId:183454,Language:{English}"
+    assert "aspect_filter" not in build_params(SearchConfig(name="x", languages=[]), g)       # per-search override off
+    assert build_params(SearchConfig(name="x", languages=["English", "French"]), g)["aspect_filter"].endswith("{English|French}")
+    with pytest.raises(ValueError):
+        build_params(SearchConfig(name="x"), GlobalConfig(languages=["English"]))                # no category -> refuse
+
+
+def test_year_aspect_and_language_combined():
+    from pokescan.config.models import SearchConfig, GlobalConfig
+    g = GlobalConfig(category_ids=["183454"], languages=["English"])
+    p = build_params(SearchConfig(name="x", years=[1999, 2000]), g)
+    assert p["aspect_filter"] == "categoryId:183454,Language:{English},Year Manufactured:{1999|2000}"
+    p = build_params(SearchConfig(name="x", years=[1999], languages=[]), g)
+    assert p["aspect_filter"] == "categoryId:183454,Year Manufactured:{1999}"
+    assert p["q"] == "pokemon"                       # aspect mode leaves the keyword query alone
+
+def test_year_title_mode():
+    from pokescan.ebay.query import expand_queries
+    from pokescan.config.models import SearchConfig, GlobalConfig
+    g = GlobalConfig(year_match="title")
+    assert expand_queries(SearchConfig(name="x", years=[1999, 2000]), g) == ["pokemon (1999, 2000)"]
+    assert expand_queries(SearchConfig(name="x", years=[1999]), g) == ["pokemon 1999"]
+    sc = SearchConfig(name="x", years=[1999, 2000], sets=["jungle", "fossil"], set_batch_size=2)
+    assert expand_queries(sc, g) == ["pokemon (jungle, fossil) (1999, 2000)"]
+    assert "aspect_filter" not in build_params(sc, GlobalConfig(year_match="title"))   # title mode adds no aspect filter
+
+
+=== FILE: ./pokescan/tests/test_phase2.py ===
+import asyncio, yaml, pathlib
+from pokescan.analysis.base import ConditionReport
+from pokescan.analysis.claude_vision import _extract_json
+from pokescan.analysis.handler import AnalysisHandler
+from pokescan.analysis.policy import QualityPolicy, Verdict
+from pokescan.config.models import AppConfig, PolicyConfig
+from pokescan.domain.models import Listing
+from pokescan.ebay.models import ItemSummary
+from pokescan.storage import db
+from pokescan.storage.repositories import AssessmentRepository, ListingRepository, NotificationRepository
+
+
+def report(**kw):
+    base = dict(image_quality="good", front_visible=True, back_visible=True, overall="near_mint_or_better", defects=[])
+    base.update(kw)
+    return ConditionReport.model_validate(base)
+
+
+def d(t, sev, conf=0.9):
+    return {"type": t, "location": "back corners", "severity": sev, "confidence": conf}
+
+
+P = QualityPolicy(PolicyConfig())
+
+
+def test_pass():
+    assert P.evaluate(report(defects=[d("whitening", "minor")])).verdict == Verdict.PASS
+
+def test_fail_major_whitening():
+    assert P.evaluate(report(defects=[d("whitening", "major")])).verdict == Verdict.FAIL
+
+def test_crease_any_fails():
+    assert P.evaluate(report(defects=[d("crease", "minor")])).verdict == Verdict.FAIL
+
+def test_low_confidence_defect_is_review():
+    assert P.evaluate(report(defects=[d("scratch", "major", 0.3)])).verdict == Verdict.REVIEW
+
+def test_unclear_photos_review():
+    assert P.evaluate(report(image_quality="insufficient")).verdict == Verdict.REVIEW
+
+def test_no_back_review():
+    assert P.evaluate(report(back_visible=False)).verdict == Verdict.REVIEW
+
+def test_slab_fail():
+    assert P.evaluate(report(is_graded_slab=True)).verdict == Verdict.FAIL
+
+def test_unknown_labels_degrade():
+    r = report(defects=[{"type": "Weird Thing", "severity": "huge", "confidence": 0.8}])
+    assert r.defects[0].type == "other" and r.defects[0].severity == "moderate"
+
+def test_extract_json_with_fences():
+    assert _extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+
+
+# ---- handler with fakes ----
+class Loader:
+    def __init__(self, enabled=True):
+        cfg = yaml.safe_load(pathlib.Path("config/searches.yaml").read_text())
+        cfg["analysis"]["enabled"] = enabled
+        self.cfg = AppConfig.model_validate(cfg)
+    def current(self): return self.cfg
+
+class FakeClient:
+    async def get_item(self, item_id):
+        return {"image": {"imageUrl": "http://x/s-l500.jpg"}, "additionalImages": [{"imageUrl": "http://x/b.jpg"}]}
+
+class FakeImages:
+    def __init__(self, tmp): self.tmp = tmp
+    async def download(self, item_id, urls):
+        out = []
+        for i, _ in enumerate(urls):
+            p = self.tmp / f"{i}.jpg"; p.write_bytes(b"x"); out.append(p)
+        return out
+
+class FakeAnalyzer:
+    def __init__(self, rep): self.rep, self.calls = rep, 0
+    async def analyze(self, listing, images):
+        self.calls += 1
+        self.rep.model = "fake"
+        return self.rep
+
+class Sink:
+    def __init__(self): self.sent = []
+    async def send(self, title, body, url=None): self.sent.append((title, body))
+
+
+def make(tmp_path, rep, enabled=True):
+    conn = db.connect(":memory:")
+    listings = ListingRepository(conn)
+    raw = {"itemId": "v1|9|0", "title": "Charizard Base Set Holo", "price": {"value": "120", "currency": "USD"},
+           "image": {"imageUrl": "http://x/s-l225.jpg"}, "itemWebUrl": "http://item"}
+    item = ItemSummary.model_validate(raw); item.raw = raw
+    listing, _ = listings.upsert("s", item)
+    sink, analyzer = Sink(), FakeAnalyzer(rep)
+    h = AnalysisHandler(Loader(enabled), FakeClient(), FakeImages(tmp_path), analyzer, sink,
+                        listings, AssessmentRepository(conn), NotificationRepository(conn))
+    return h, listing, sink, analyzer, conn
+
+
+def test_handler_pass_notifies_once(tmp_path):
+    h, listing, sink, an, conn = make(tmp_path, report())
+    asyncio.run(h.process(listing)); asyncio.run(h.process(listing))
+    assert len(sink.sent) == 1 and sink.sent[0][0].startswith("PASS")
+    assert an.calls == 1                       # second call short-circuits on existing assessment
+    assert conn.execute("SELECT verdict FROM assessments").fetchone()[0] == "pass"
+    assert conn.execute("SELECT COUNT(*) FROM listing_images WHERE local_path IS NOT NULL").fetchone()[0] == 2
+
+def test_handler_fail_silent_but_stored(tmp_path):
+    h, listing, sink, an, conn = make(tmp_path, report(defects=[d("crease", "moderate")]))
+    asyncio.run(h.process(listing))
+    assert sink.sent == [] and conn.execute("SELECT verdict FROM assessments").fetchone()[0] == "fail"
+
+def test_handler_disabled(tmp_path):
+    h, listing, sink, an, _ = make(tmp_path, report(), enabled=False)
+    asyncio.run(h.process(listing))
+    assert an.calls == 0
+
+def test_skip_title_term(tmp_path):
+    h, listing, sink, an, _ = make(tmp_path, report())
+    l2 = Listing(**{**listing.__dict__, "title": "PSA 9 Charizard"})
+    asyncio.run(h.process(l2))
+    assert an.calls == 0
+
+
+def test_japanese_auto_fail_costs_nothing(tmp_path):
+    h, listing, sink, an, conn = make(tmp_path, report())
+    calls = []
+    async def spy(item_id): calls.append(item_id); return {}
+    h.client.get_item = spy
+    for title in ("Charizard Japanese Base Set Holo", "Blastoise JP Holo 1996", "Venusaur JPN rare"):
+        l = Listing(**{**listing.__dict__, "title": title, "item_id": title})
+        conn.execute("INSERT INTO listings (item_id,title,raw_json) VALUES (?,?,?)", (title, title, "{}"))
+        asyncio.run(h.process(l))
+    assert an.calls == 0 and calls == [] and sink.sent == []
+    rows = conn.execute("SELECT model, verdict FROM assessments").fetchall()
+    assert len(rows) == 3 and all(r["verdict"] == "fail" and r["model"] == "rule" for r in rows)
+
+def test_english_listing_not_caught_by_japanese_rule(tmp_path):
+    h, listing, sink, an, conn = make(tmp_path, report())
+    asyncio.run(h.process(listing))      # "Charizard Base Set Holo"
+    assert an.calls == 1
+
+
+def test_cjk_term_matches_inside_text():
+    assert AnalysisHandler._skip_by_title("リザードン 日本語版 初版", ["日本語"]) == "日本語"
+    assert AnalysisHandler._skip_by_title("Charizard Japanese", ["japanese"]) == "japanese"
+    assert AnalysisHandler._skip_by_title("Jumpluff Holo", ["jp"]) is None   # whole-word only
+
+
+def _with_language(h, value):
+    async def gi(item_id):
+        aspects = [{"type": "STRING", "name": "Language", "value": value}] if value else [{"name": "Set", "value": "Jungle"}]
+        return {"image": {"imageUrl": "http://x/a.jpg"}, "additionalImages": [], "localizedAspects": aspects}
+    h.client.get_item = gi
+
+def test_language_aspect_japanese_fails_before_photos(tmp_path):
+    cfgd = None
+    h, listing, sink, an, conn = make(tmp_path, report())
+    h.loader.cfg.analysis.allowed_languages = ["English"]
+    _with_language(h, "Japanese")
+    asyncio.run(h.process(listing))
+    assert an.calls == 0 and sink.sent == []
+    assert conn.execute("SELECT verdict, model FROM assessments").fetchone()[:] == ("fail", "rule")
+    assert conn.execute("SELECT COUNT(*) FROM listing_images WHERE local_path IS NOT NULL").fetchone()[0] == 0
+
+def test_language_english_and_blank_pass_through(tmp_path):
+    for value in ("English", None):
+        h, listing, sink, an, conn = make(tmp_path, report())
+        h.loader.cfg.analysis.allowed_languages = ["English"]
+        _with_language(h, value)
+        asyncio.run(h.process(listing))
+        assert an.calls == 1, value
+
+
+=== FILE: ./pokescan/tests/test_poller.py ===
+import asyncio
+from pokescan.config.models import GlobalConfig, SearchConfig
+from pokescan.ebay.models import ItemSummary, SearchPage
+from pokescan.pipeline.poller import SearchPoller
+from pokescan.storage import db
+from pokescan.storage.repositories import ListingRepository, PollRunRepository
+
+
+def item(i):
+    raw = {"itemId": f"v1|{i}|0", "title": f"Charizard {i}", "price": {"value": "50", "currency": "USD"}}
+    it = ItemSummary.model_validate(raw); it.raw = raw
+    return it
+
+
+class FakeClient:
+    def __init__(self, pages):          # pages: list of lists of ids; beyond the end -> always "new" items
+        self.pages, self.calls = pages, 0
+    async def search(self, params):
+        n = int(params["offset"]) // int(params["limit"])
+        self.calls += 1
+        ids = self.pages[n] if n < len(self.pages) else [1000 + n * 10 + k for k in range(2)]
+        return SearchPage(items=[item(i) for i in ids], total=99, next_url="more")
+
+
+def setup(pages, preseed=()):
+    conn = db.connect(":memory:")
+    repo = ListingRepository(conn)
+    for i in preseed:
+        repo.upsert("s", item(i))
+    return SearchPoller(FakeClient(pages), repo, PollRunRepository(conn)), conn
+
+
+G = GlobalConfig(page_size=2, max_pages=3)
+S = SearchConfig(name="s")
+
+
+def test_stops_at_first_seen_listing():
+    poller, conn = setup([[1, 2], [3, 99]], preseed=[99])
+    fresh = asyncio.run(poller.poll(S, G))
+    assert [l.item_id for l in fresh] == ["v1|1|0", "v1|2|0", "v1|3|0"]
+    assert poller.client.calls == 2                       # page 2 had an old item -> stop
+    assert conn.execute("SELECT calls FROM poll_runs").fetchone()[0] == 2
+
+
+def test_max_pages_bounds_the_walk():
+    poller, _ = setup([], preseed=[99])                   # never meets an old item
+    asyncio.run(poller.poll(S, G))
+    assert poller.client.calls == 3
+
+
+def test_short_page_ends_paging():
+    poller, _ = setup([[1], ], preseed=[99])              # fewer items than page_size -> last page
+    asyncio.run(poller.poll(S, G))
+    assert poller.client.calls == 1
+
+
+def test_first_run_seeds_silently():
+    poller, conn = setup([[1, 2], [3, 4], [5, 6]])
+    assert asyncio.run(poller.poll(S, G)) == []
+    assert conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 6
+
+
+=== FILE: ./searches.yaml ===
+# Edit while the daemon runs; changes apply within a few seconds.
+global:
+  daily_call_budget: 4000          # stay under your real limit (Analytics API getRateLimits)
+  marketplace: EBAY_US
+  category_ids: ["183454"]         # CCG Individual Cards - verify in eBay's category tree
+  languages: []                    # API-level Language filter (drops listings with the field blank). [English] to enable
+  year_match: aspect               # aspect = eBay "Year Manufactured" filter (drops listings with it blank)
+                                   # title  = year as a keyword (only finds titles that contain the year)
+  year_aspect_name: Year Manufactured   # confirm the exact name with: python -m pokescan.check
+  page_size: 100                   # listings per call (max 200)
+  max_pages: 3                     # pages per query per poll; stops early once it reaches listings already seen
+  intervals_minutes: { high: 5, normal: 10, low: 30 }
+
+searches:
+  - name: wotc-era
+    enabled: false
+    years: [1999, 2000, 2001, 2002]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle, "art card"]
+    filters:
+      price_min: 25
+      price_max: 5000
+      buying_options: [FIXED_PRICE, AUCTION]
+    priority: high
+
+  - name: ex-era
+    enabled: true
+    years: [2003, 2004, 2005, 2006, 2007]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 15, price_max: 3000 }
+    priority: normal
+
+  - name: hgss-era
+    enabled: false
+    years: [2010, 2011]
+    exclude_terms: [lot, proxy, custom, reprint, digital, bundle]
+    filters: { price_min: 10, price_max: 1500 }
+    priority: normal
+
+  # Years and sets can be combined to narrow things down (sets become a keyword OR-group):
+  # - name: unleashed-undaunted
+  #   years: [2010, 2011]
+  #   sets: [undaunted, call of legends, unleashed, triumphant]
+  #   set_batch_size: 4
+
+# ---- Phase 2: AI photo grading ----
+analysis:
+  enabled: false                   # set true once Phase 1 is running and ANTHROPIC_API_KEY is in .env
+  analyzer: classical              # classical = free OpenCV back-whitening check | claude = vision model
+  model: claude-sonnet-5-5         # claude analyzer only; change requires restart
+  max_images: 4
+  fetch_all_photos: true           # 1 getItem call per analyzed listing; needed to see the back of the card
+  max_analyses_per_day: 150        # hard cap on model spend
+  allowed_languages: [English]     # checked on listing details: Language set and not English -> FAIL; blank passes
+  auto_fail_title_terms: [japanese, japan, jpn, jp, 日本語, 日本]   # stored as FAIL before any photo/API spend
+  skip_title_terms: [psa, bgs, cgc, damaged, "heavily played", hp, poor, proxy]
+  classical:                       # tune these on real listings (see debug_dir images)
+    whitening_thresholds: [0.03, 0.12, 0.30]   # share of edge-band pixels that look white: minor / moderate / major
+    glare_zone_max: 0.35           # zone more than this covered by glare = "not checked" (never a fail)
+    blur_min: 15
+    debug_dir: data/debug          # saves annotated images per photo; set to null once calibrated
+  policy:
+    max_unassessed_zones: 2        # >2 of 8 edge zones hidden by glare -> REVIEW
+    max_severity:                  # worst tolerated per defect: none | minor | moderate | major
+      whitening: minor
+      edge_wear: minor
+      corner_wear: minor
+      scratch: minor
+      crease: none
+      dent: none
+      stain: none
+    min_confidence: 0.6            # less sure than this -> REVIEW instead of FAIL
+    require_back_photo: true
+    skip_graded: true
+    notify_review: true            # also push "photos unclear" listings for a manual look

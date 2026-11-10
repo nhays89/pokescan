@@ -12,7 +12,7 @@ class AnalysisHandler:
     model calls never block the eBay polling loop; run() drains the queue."""
 
     def __init__(self, loader, client, images, analyzer, notifier, listings, assessments, notifications,
-                 queue_size: int = 200):
+                 queue_size: int = 5000):
         self.loader, self.client, self.images, self.analyzer = loader, client, images, analyzer
         self.notifier, self.listings = notifier, listings
         self.assessments, self.notifications = assessments, notifications
